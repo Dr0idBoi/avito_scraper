@@ -239,22 +239,38 @@ async def launch_browser():
             "--no-sandbox",
         ],
     }
-    browser = await (pw.chromium.launch(channel=CHROME_CHANNEL, **launch_kwargs)
-                     if CHROME_CHANNEL else pw.chromium.launch(**launch_kwargs))
+    # внутри launch_browser()
 
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    browser = await (pw.chromium.launch(channel=CHROME_CHANNEL, **{
+        "headless": HEADLESS,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--use-gl=swiftshader", "--enable-webgl",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",  # <— добавили
+        ],
+    }) if CHROME_CHANNEL else pw.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--use-gl=swiftshader", "--enable-webgl",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",  # <— добавили
+        ],
+    ))
 
     context = await browser.new_context(
-        storage_state=STORAGE_STATE if os.path.exists(STORAGE_STATE) else None,
-        user_agent=UA,
+        storage_state=STORAGE_STATE,
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
         locale="ru-RU",
         timezone_id="Europe/Moscow",
         viewport={"width": 1280, "height": 900},
     )
 
-    context.set_default_navigation_timeout(60_000)
-    context.set_default_timeout(30_000)
+    # щедрее таймауты
+    context.set_default_navigation_timeout(90_000)
+    context.set_default_timeout(60_000)
     await context.set_extra_http_headers({"Accept-Language": "ru-RU,ru;q=0.9"})
 
     if BLOCK_MEDIA:
@@ -776,7 +792,81 @@ async def extract_item_fields(page_url: str, context) -> Optional[Dict[str, Any]
 
     await page.close()
     return record
+async def _open_category_or_fail(page, start_url: str, slug_hint: str, captcha_mode: str = "auto") -> bool:
+    """
+    Открывает страницу категории «по-умному»:
+    - первый goto ждёт только commit (быстрый ответ сервера)
+    - далее крутим цикл: проверяем firewall и наличие ссылок карточек
+    Возвращает True, если категория готова; False — если не удалось.
+    """
+    # 1) быстрый заход
+    try:
+        await page.goto(start_url, wait_until="commit", timeout=45_000)
+    except Exception as e:
+        jlog("WARN", "Goto(commit) не успел", url=start_url, error=str(e))
 
+    # 2) ждём контент каталога или firewall (до ~60с)
+    t0 = time.time()
+    last_err = ""
+    while time.time() - t0 < 60:
+        try:
+            html = await page.content()
+        except Exception as e:
+            last_err = str(e)
+            await asyncio.sleep(1.5)
+            continue
+
+        if "js-firewall-form" in html.lower() or "h-captcha" in html.lower() or "firewall-title" in html.lower():
+            jlog("WARN", "Обнаружен firewall на категории")
+            # если есть возможность — даём шанс вручную решить (если HEADLESS=0)
+            if os.getenv("CAPTCHA_MODE", "manual").lower() == "manual" and (os.getenv("HEADLESS", "1") in ("0","false","no")):
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
+                jlog("WARN", "Решите капчу в окне браузера и вернитесь в консоль")
+                # ждём, пока уйдёт firewall
+                solved = False
+                t1 = time.time()
+                while time.time() - t1 < 180:
+                    html2 = await page.content()
+                    if not ("js-firewall-form" in html2.lower() or "h-captcha" in html2.lower() or "firewall-title" in html2.lower()):
+                        solved = True
+                        break
+                    await asyncio.sleep(2)
+                if not solved:
+                    save_snapshot(html, "category_firewall_unsolved")
+                    return False
+                # иначе продолжаем цикл, чтобы дождаться контента
+            else:
+                save_snapshot(html, "category_firewall_headless")
+                return False
+
+        # контент каталога обычно даёт ссылки вида /<slug>/..._1234567
+        if slug_hint:
+            locator = page.locator(f'a[href*="/{slug_hint}/"]')
+            try:
+                if await locator.count() > 0:
+                    return True
+            except Exception:
+                pass
+
+        # как минимум, если на странице есть <a> с id-паттерном карточки — тоже ок
+        anchors = re.findall(r'href="([^"]+_\d{7,})"', html)
+        if anchors:
+            return True
+
+        await asyncio.sleep(1.2)
+
+    # таймаут ожидания
+    try:
+        html = await page.content()
+        save_snapshot(html, "category_open_timeout")
+    except Exception:
+        pass
+    if last_err:
+        jlog("ERROR", "Категория не открылась", error=last_err)
+    return False
 # -------------------- Main flow --------------------
 async def run(start_url: str, max_items: int, skip_robots: bool = False):
     domain_root = "https://www.avito.ru"
@@ -801,13 +891,17 @@ async def run(start_url: str, max_items: int, skip_robots: bool = False):
 
     pw, browser, context = await launch_browser()
     page = await context.new_page()
-    page.set_default_navigation_timeout(60_000)
+    page.set_default_navigation_timeout(90_000)
 
-    try:
-        await page.goto(start_url, wait_until="domcontentloaded", timeout=60_000)
-    except Exception as e:
-        jlog("ERROR", "Не удалось открыть страницу категории/поиска", url=start_url, error=str(e))
-        await browser.close(); await pw.stop(); conn.close(); return
+    slug = _derive_category_slug(start_url)
+
+    ok_open = await _open_category_or_fail(page, start_url, slug_hint=slug)
+    if not ok_open:
+        jlog("ERROR", "Категория не открылась (после commit-режима)", url=start_url)
+        await browser.close();
+        await pw.stop();
+        conn.close();
+        return
 
     await dismiss_overlays(page)
 
