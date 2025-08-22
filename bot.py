@@ -108,7 +108,7 @@ async def _handle_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
             out_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
             # запускаем скрейпер (он async)
-            await avito_scraper.run(url, count, skip_robots=False)
+            await avito_scraper.run(url, count, skip_robots=True)
 
             payload = _jsonl_to_array_bytes(out_jsonl)
             ts = int(time.time())
