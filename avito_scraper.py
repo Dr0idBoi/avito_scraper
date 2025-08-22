@@ -20,7 +20,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit
@@ -52,6 +52,30 @@ async def _nap():
     await asyncio.sleep(random.uniform(SLOW_MIN, SLOW_MAX))
 
 # -------------------- Утилиты --------------------
+
+def _num_0_5(s: str) -> Optional[float]:
+    """Достаём число 0..5 из строки (поддержка '5,0', '4.5', '5 из 5')."""
+    if not s:
+        return None
+    m = re.search(r"([0-5](?:[.,]\d)?)\s*(?:из\s*5)?", s, flags=re.I)
+    if not m:
+        return None
+    v = m.group(1).replace(",", ".")
+    try:
+        f = float(v)
+        return max(0.0, min(5.0, f))
+    except Exception:
+        return None
+
+def _attrs_text_chain(node) -> str:
+    """Конкатенация aria-label/title/alt для узла и его потомков."""
+    parts = []
+    for el in [node, *node.find_all(True, recursive=True)]:
+        for a in ("aria-label", "title", "alt"):
+            if el.has_attr(a) and el.get(a):
+                parts.append(str(el.get(a)))
+    return " | ".join(parts)
+
 def normalize_avito_url(u: str) -> str:
     if not u:
         return u
@@ -152,11 +176,30 @@ async def dismiss_overlays(page) -> None:
     except Exception:
         pass
 
+async def _close_noise(page) -> None:
+    """Прижимаем налипшие баннеры/тосты (Бизнес 360 и т.п.)."""
+    try:
+        xbtn = page.locator('button[aria-label*="Закрыть"], [role="button"]:has-text("Закрыть")')
+        if await xbtn.count():
+            try:
+                await xbtn.first.click(timeout=800)
+            except Exception:
+                pass
+        await page.evaluate("""() => {
+          const bad = [
+            '[data-marker*="business-360"]',
+            '[class*="Business360"]', '[class*="b360"]',
+            '[data-marker*="toast"]'
+          ];
+          for (const sel of bad) document.querySelectorAll(sel).forEach(n => n.remove());
+          const sticky = [...document.querySelectorAll('div')].find(d => d.textContent && d.textContent.includes('Бизнес 360'));
+          if (sticky) sticky.remove();
+        }""")
+    except Exception:
+        pass
+
 async def wait_firewall_solved(page, timeout_ms: int = 180_000) -> bool:
-    """
-    Ждём, пока пользователь решит капчу в открытом окне (HEADLESS=0).
-    Проверяем DOM каждые 2 сек до timeout_ms. True — капча ушла.
-    """
+    """Ждём, пока вы решите капчу в открытом окне (HEADLESS=0)."""
     start = time.time()
     try:
         await page.bring_to_front()
@@ -174,7 +217,7 @@ async def wait_firewall_solved(page, timeout_ms: int = 180_000) -> bool:
     return False
 
 # -------------------- Сбор ссылок --------------------
-async def _derive_category_slug(start_url: str) -> str:
+def _derive_category_slug(start_url: str) -> str:
     try:
         u = urlparse(start_url)
         parts = (u.path or "/").strip("/").split("/")
@@ -201,7 +244,7 @@ async def collect_links(page, max_links: int, start_url: str) -> List[str]:
                 links.append(h)
         return total, matched
 
-    slug = await _derive_category_slug(start_url)
+    slug = _derive_category_slug(start_url)
     if slug:
         try:
             await page.wait_for_selector(f'a[href*="/{slug}/"]', timeout=15_000)
@@ -231,8 +274,33 @@ async def collect_links(page, max_links: int, start_url: str) -> List[str]:
 
     return links[:max_links]
 
-# -------------------- Парсинг карточки --------------------
-def _extract_rating(soup: BeautifulSoup) -> float:
+# -------------------- Рейтинг продавца --------------------
+def _extract_seller_rating(soup: BeautifulSoup) -> float:
+    """
+    Точный парсинг рейтинга продавца.
+    1) Сначала верстка Avito: .seller-info-rating .CiqtH -> '5,0'
+    2) Или ищем блок [data-marker="sellerRate"] и берём ближайшее число 0..5 в родительском тексте.
+    3) Fallback: JSON-LD / aria-label / 'из 5' / общий текст.
+    """
+
+    # 1) Явный блок рядом со звёздами
+    el = soup.select_one('.seller-info-rating .CiqtH')
+    if el:
+        v = _num_0_5(el.get_text(strip=True))
+        if v is not None:
+            return float(v)
+
+    # 2) От блока sellerRate вверх/вокруг
+    sr = soup.select_one('[data-marker="sellerRate"]')
+    if sr:
+        # ближайший видимый контекст
+        parent = sr.parent or sr
+        text_ctx = parent.get_text(" ", strip=True)
+        v = _num_0_5(text_ctx)
+        if v is not None:
+            return float(v)
+
+    # 3) Прежние общие эвристики
     try:
         for node in soup.select('script[type="application/ld+json"]'):
             txt = (node.get_text() or "").strip()
@@ -241,32 +309,118 @@ def _extract_rating(soup: BeautifulSoup) -> float:
             data = json.loads(txt)
             datas = data if isinstance(data, list) else [data]
             for obj in datas:
-                if isinstance(obj, dict):
-                    if obj.get("@type") == "AggregateRating" and obj.get("ratingValue"):
-                        v = str(obj["ratingValue"]).replace(",", ".")
-                        return float(re.sub(r"[^\d.]", "", v))
-                    if "aggregateRating" in obj and isinstance(obj["aggregateRating"], dict):
-                        v = str(obj["aggregateRating"].get("ratingValue", "")).replace(",", ".")
-                        if v:
-                            return float(re.sub(r"[^\d.]", "", v))
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("@type") == "AggregateRating" and obj.get("ratingValue"):
+                    v = _num_0_5(str(obj["ratingValue"]))
+                    if v is not None:
+                        return float(v)
+                ag = obj.get("aggregateRating")
+                if isinstance(ag, dict) and ag.get("ratingValue"):
+                    v = _num_0_5(str(ag["ratingValue"]))
+                    if v is not None:
+                        return float(v)
     except Exception:
         pass
 
-    for el in soup.select('[aria-label*="из 5"], [title*="из 5"]'):
-        src = el.get("aria-label") or el.get("title") or ""
-        m = re.search(r"([0-5](?:[.,]\d)?)\s*из\s*5", src)
-        if m:
-            return float(m.group(1).replace(",", "."))
-    txt = soup.get_text(" ", strip=True)
-    m = re.search(r"([0-5](?:[.,]\d)?)\s*из\s*5", txt)
-    return float(m.group(1).replace(",", ".")) if m else 0.0
+    for node in soup.select('[aria-label], [title], [alt]'):
+        s = (node.get("aria-label") or node.get("title") or node.get("alt") or "").strip()
+        if not s:
+            continue
+        if ("из 5" in s) or ("рейтинг" in s.lower()) or ("оцен" in s.lower()):
+            v = _num_0_5(s)
+            if v is not None:
+                return float(v)
+
+    v = _num_0_5(soup.get_text(" ", strip=True))
+    return float(v) if v is not None else 0.0
+
+# -------------------- Отзывы: разметка и парсинг --------------------
+EXCLUDE_SNIPPETS = ("Вы открыли объявление в Бизнес 360",)
+
+def _parse_reviews_from_html(html: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Идём от реальных звёздочек отзыва:
+      <div data-marker="review(5)/score"> … </div>
+    Число берём из data-marker (review(5)), текст — из ближайшего большого контейнера.
+    Если такой разметки нет, включаются старые эвристики.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    reviews: List[Dict[str, Any]] = []
+    seen = set()
+
+    # 1) Точный вариант по data-marker
+    star_nodes = soup.select('[data-marker^="review("][data-marker$="/score"]')
+    for sn in star_nodes:
+        dm = sn.get("data-marker", "")
+        m = re.match(r"review\(([\d.,]+)\)/score", dm)
+        rating = float(m.group(1).replace(",", ".")) if m else 0.0
+
+        # берём крупный контейнер с текстом вокруг звёзд
+        container = (sn.find_parent("article")
+                     or sn.find_parent("li")
+                     or sn.find_parent("section")
+                     or sn.find_parent("div")
+                     or sn)
+
+        txt = container.get_text(" ", strip=True)
+        # подсчищаем технические подписи типа «Рейтинг 1», «Рейтинг 2» и т.п.
+        txt = re.sub(r"Рейтинг\s+\d(\s|$)", " ", txt, flags=re.I)
+        if not txt or len(txt) < 40:
+            continue
+        if any(s in txt for s in EXCLUDE_SNIPPETS):
+            continue
+
+        h = hash(txt)
+        if h in seen:
+            continue
+        seen.add(h)
+        reviews.append({"review": txt, "rate": float(max(0.0, min(5.0, rating)))})
+        if len(reviews) >= limit:
+            return reviews
+
+    # 2) Fallback: старые эвристики (на случай другой вёрстки)
+    containers = soup.select('[data-marker*="review"], [data-marker*="feedback"], article, section, li')
+    for c in containers:
+        if len(reviews) >= limit:
+            break
+        txt = c.get_text(" ", strip=True)
+        if not txt or len(txt) < 40:
+            continue
+        if any(s in txt for s in EXCLUDE_SNIPPETS):
+            continue
+        if not ("Сделка состоялась" in txt
+                or re.search(r"\b(Покупатель|Продавец)\b", txt, re.I)
+                or re.search(r"\bиз\s*5\b", txt)):
+            continue
+
+        rating = None
+        attrs_str = _attrs_text_chain(c)
+        rating = _num_0_5(attrs_str)
+        if rating is None:
+            rating = _num_0_5(txt)
+        if rating is None:
+            star_nodes = c.select('[class*="star"], [aria-label*="звезд"], [title*="звезд"]')
+            for sn in star_nodes:
+                s = (sn.get("aria-label") or sn.get("title") or sn.get_text(" ", strip=True) or "")
+                v = _num_0_5(s)
+                if v is not None:
+                    rating = v
+                    break
+
+        h = hash(txt)
+        if h in seen:
+            continue
+        seen.add(h)
+        reviews.append({"review": txt, "rate": float(rating or 0.0)})
+
+    return reviews[:limit]
 
 async def _open_reviews_if_any(page) -> str:
     """
     Пытаемся открыть «Отзывы» (модалка или вкладка профиля).
     Возвращаем "dialog" | "page" | "".
     """
-    # Кнопка/ссылка «Отзывы»
     try:
         loc = page.locator("a,button", has_text=re.compile(r"отзыв", re.I))
         if await loc.count():
@@ -285,7 +439,6 @@ async def _open_reviews_if_any(page) -> str:
     except Exception:
         pass
 
-    # Профиль -> вкладка «Отзывы»
     try:
         prof = page.locator('a[href*="/profile"], a[href*="/user/"], a:has-text("Профиль"), a:has-text("Пользователь")')
         if await prof.count():
@@ -300,74 +453,56 @@ async def _open_reviews_if_any(page) -> str:
         pass
     return ""
 
-def _parse_reviews_from_html(html: str, limit: int = 50) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "lxml")
-    out: List[Dict[str, Any]] = []
-    seen = set()
-    for c in soup.select("article, li, div"):
-        txt = c.get_text(" ", strip=True)
-        if not txt or len(txt) < 60:
-            continue
-        if "Бизнес 360" in txt or "Вы открыли объявление" in txt:
-            continue
-        if not ("Сделка состоялась" in txt or "Покупатель" in txt or "Продавец" in txt or re.search(r"\bиз\s*5\b", txt)):
-            continue
-        rating = 0.0
-        lab = c.select_one('[aria-label*="из 5"], [title*="из 5"]')
-        if lab:
-            src = lab.get("aria-label") or lab.get("title") or ""
-            m = re.search(r"([0-5](?:[.,]\d)?)\s*из\s*5", src)
-            if m:
-                rating = float(m.group(1).replace(",", "."))
-        if rating == 0.0:
-            m = re.search(r"([0-5](?:[.,]\d)?)\s*из\s*5", txt)
-            if m:
-                rating = float(m.group(1).replace(",", "."))
-        h = hash(txt)
-        if h in seen:
-            continue
-        seen.add(h)
-        out.append({"review": txt, "rate": float(rating)})
-        if len(out) >= limit:
-            break
-    return out
-
 async def _collect_reviews(page, mode: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Собираем отзывы из открытой модалки или страницы профиля (mode='dialog'|'page')."""
     reviews: List[Dict[str, Any]] = []
     stagnant = 0
-    for _ in range(10):
+
+    for _ in range(12):
         if mode == "dialog":
-            html = await page.evaluate("""() => {
-              const dlg = document.querySelector('[role="dialog"]');
-              return dlg ? dlg.innerHTML : document.documentElement.innerHTML;
-            }""")
+            html = await page.evaluate("""
+                () => {
+                  const dlg = document.querySelector('[role="dialog"]');
+                  return dlg ? dlg.innerHTML : document.documentElement.innerHTML;
+                }
+            """)
         else:
             html = await page.content()
-        batch = _parse_reviews_from_html(html, limit=limit - len(reviews))
+
+        batch = _parse_reviews_from_html(html, limit=limit-len(reviews))
+
         before = len(reviews)
         for b in batch:
             if b not in reviews:
                 reviews.append(b)
                 if len(reviews) >= limit:
                     break
+
         if len(reviews) >= limit:
             break
+
         stagnant = stagnant + 1 if len(reviews) == before else 0
+        if stagnant >= 3:
+            break
+
         try:
             if mode == "dialog":
-                await page.evaluate("""() => {
-                  const dlg = document.querySelector('[role="dialog"]');
-                  if (dlg) dlg.scrollTop = dlg.scrollHeight;
-                }""")
+                await page.evaluate("""
+                  () => {
+                    const dlg = document.querySelector('[role="dialog"]');
+                    if (dlg) dlg.scrollTop = dlg.scrollHeight;
+                  }
+                """)
             else:
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
         except Exception:
             break
+
         await _nap()
-        if stagnant >= 3:
-            break
+
     return reviews
 
+# -------------------- Парсинг карточки --------------------
 async def extract_item(page_url: str, context) -> Optional[Dict[str, Any]]:
     import html as htmllib
 
@@ -382,7 +517,6 @@ async def extract_item(page_url: str, context) -> Optional[Dict[str, Any]]:
         _log("WARN", "Ошибка навигации к карточке", url=url, error=str(e))
         await page.close(); return None
 
-    # ждём что-то осмысленное (title/meta) ИЛИ firewall
     try:
         await page.wait_for_selector(
             'meta[property="og:title"], [data-marker="item-view/title"], h1, '
@@ -469,11 +603,13 @@ async def extract_item(page_url: str, context) -> Optional[Dict[str, Any]]:
                 features_texts.append(txt)
     features_flat = flatten_text(features_texts)
 
-    seller_rate = _extract_rating(soup)
+    # общий рейтинг продавца — точный
+    seller_rate = _extract_seller_rating(soup)
 
     # отзывы (по возможности)
     reviews: List[Dict[str, Any]] = []
     try:
+        await _close_noise(page)
         mode = await _open_reviews_if_any(page)
         if mode:
             reviews = await _collect_reviews(page, mode=mode, limit=50)
@@ -506,7 +642,6 @@ async def scrape(start_url: str, max_items: int, out_path: Optional[str] = None)
 
     await dismiss_overlays(page)
 
-    # если встретили firewall на категории — ждём ручного решения (окно открыто)
     html0 = (await page.content())
     if is_avito_firewall(html0):
         solved = await wait_firewall_solved(page, timeout_ms=180_000)

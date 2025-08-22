@@ -28,7 +28,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 import avito_scraper
 
 # ---- Токен бота ----
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip() or "7051340892:AAFAxEGGGefLS6gHLM6uMaoQ8vKMaVXmd10"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip() or "8484733569:AAEzPeCV5XHTd0imugszyFITiZvX5KfDyTI"
 
 # ---- Логгирование (чтобы видеть ошибки) ----
 logging.basicConfig(
