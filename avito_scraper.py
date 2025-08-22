@@ -273,36 +273,62 @@ def _num_0_5(s: str) -> Optional[float]:
         return None
 
 def _extract_seller_rating(soup: BeautifulSoup) -> float:
-    cont = soup.select_one('.Ww4IN.seller-info-rating') or soup.select_one('[data-marker="sellerRate"], [data-marker*="sellerRate"]')
-    if cont:
-        v = _num_0_5(cont.get_text(" ", strip=True))
-        if v is not None: return v
-        lab = cont.select_one('[aria-label*="Рейтинг"], [aria-label*="из 5"], [title*="из 5"]')
-        if lab:
-            v = _num_0_5(lab.get("aria-label") or lab.get("title") or "")
-            if v is not None: return v
-
+    """
+    Пытаемся достать общий рейтинг продавца максимально надёжно:
+    1) JSON-LD AggregateRating / aggregateRating
+    2) Любые aria-label/title/alt с текстом про рейтинг/«из 5»
+    3) Текст рядом с блоком 'Отзывы' / 'оценок' / 'рейтинг'
+    4) Fallback — первое число 0..5 на странице
+    """
+    # 1) JSON-LD
     try:
         for node in soup.select('script[type="application/ld+json"]'):
             txt = (node.get_text() or "").strip()
-            if not txt: continue
+            if not txt:
+                continue
             data = json.loads(txt)
             datas = data if isinstance(data, list) else [data]
             for obj in datas:
-                if isinstance(obj, dict):
-                    if obj.get("@type") == "AggregateRating":
-                        v = _num_0_5(str(obj.get("ratingValue",""))); if v is not None: return v
-                    ag = obj.get("aggregateRating")
-                    if isinstance(ag, dict):
-                        v = _num_0_5(str(ag.get("ratingValue","")));    if v is not None: return v
+                if not isinstance(obj, dict):
+                    continue
+                # Прямой AggregateRating
+                if obj.get("@type") == "AggregateRating":
+                    v = _num_0_5(str(obj.get("ratingValue", "")))
+                    if v is not None:
+                        return v
+                # Вложенный aggregateRating
+                ag = obj.get("aggregateRating")
+                if isinstance(ag, dict):
+                    v = _num_0_5(str(ag.get("ratingValue", "")))
+                    if v is not None:
+                        return v
     except Exception:
         pass
 
-    for el in soup.select('[aria-label*="из 5"], [title*="из 5"]'):
-        v = _num_0_5(el.get("aria-label") or el.get("title") or "")
-        if v is not None: return v
+    # 2) aria-label/title/alt
+    for el in soup.select('[aria-label], [title], [alt]'):
+        s = (el.get("aria-label") or el.get("title") or el.get("alt") or "").strip()
+        if not s:
+            continue
+        if ("из 5" in s) or ("рейтинг" in s.lower()) or ("оцен" in s.lower()):
+            v = _num_0_5(s)
+            if v is not None:
+                return v
 
-    v = _num_0_5(soup.get_text(" ", strip=True))
+    # 3) Ближайший текст к словам «Отзывы/оценк/рейтинг»
+    hint_blocks = soup.find_all(string=re.compile(r"(отзыв|оценк|рейтинг)", re.I))
+    for hb in hint_blocks:
+        try:
+            ctx = hb.parent.get_text(" ", strip=True)
+            v = _num_0_5(ctx)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+
+    # 4) Fallback
+    page_text = soup.get_text(" ", strip=True)
+    v = _num_0_5(page_text)
     return float(v) if v is not None else 0.0
 
 def _attrs_text_chain(node) -> str:
