@@ -1,129 +1,64 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Avito category/search -> items scraper (Playwright, BS4, JSON Schema)
-Перезапись JSONL на каждый запуск + SQLite-дедупликация обработанных URL.
-Собирает именно НЕВИДЕННЫЕ ссылки (учитывая SQLite) до N штук.
+Avito category/search -> items scraper (Playwright + BS4)
+— Серверная версия: читает настройки из .env, поддерживает прокси
+— Авто-обход robots.txt (если недоступен/403 — продолжаем)
+— Устойчивое открытие страниц (commit→ожидания, снапшоты при проблемах)
+— Рейтинг продавца и баллы каждого отзыва приводятся к числу (0..5)
 
-Обновлено:
-- Точный парсинг общего рейтинга продавца (.seller-info-rating .CiqtH или контекст вокруг [data-marker="sellerRate"])
-- Точный парсинг рейтинга каждого отзыва через [data-marker="review(X)/score"]
-- Подчищены эвристики отзывов и шумовые баннеры
+Асинхронный API:
+  await run(start_url: str, max_items: int, skip_robots: bool = True)
 
-Запуск:
-  python avito_scraper.py --start-url "https://www.avito.ru/moskva/velosipedy?cd=1" --max-items 2
+Результат:
+  JSONL в data/avito_items.jsonl (перезаписывается на каждый запуск)
 """
 
-import asyncio
-import json
 import os
-import random
 import re
-import sys
+import json
 import time
-import sqlite3
-from datetime import datetime, timezone, timedelta
+import asyncio
+import random
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
-from jsonschema import Draft202012Validator
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
-from dotenv import load_dotenv
 
-# -------------------- Env / Config --------------------
-load_dotenv()
-
-USER_AGENT = os.getenv(
-    "SCRAPER_USER_AGENT",
-    "IP-Analytics-AvitoScraper/0.2 (+contact: your-email@example.com)"
-)
-DEFAULT_HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"}
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
-SLOW_MIN, SLOW_MAX = 0.7, 1.8
-MAX_RETRIES = 3
-
-MSK_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
-
+# -------------------- Директории/константы --------------------
 DATA_DIR = Path("./data")
 SNAP_DIR = Path("./snapshots")
-LOG_DIR = Path("./logs")
-HEADLESS = os.getenv("HEADLESS", "0").lower() not in ("0", "false", "no")
-BLOCK_MEDIA = os.getenv("BLOCK_MEDIA", "0").lower() in ("1", "true", "yes")
-CHROME_CHANNEL = os.getenv("CHROME_CHANNEL", "").strip()
-CAPTCHA_MODE = os.getenv("CAPTCHA_MODE", "manual").lower()
-
-for d in (DATA_DIR, SNAP_DIR, LOG_DIR):
+for d in (DATA_DIR, SNAP_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-STORAGE_STATE = os.getenv("STORAGE_STATE", str(DATA_DIR / "state.json"))
 OUTPUT_JSONL = DATA_DIR / "avito_items.jsonl"
-DB_PATH = DATA_DIR / "seen_urls.sqlite3"   # SQLite с обработанными URL
 
-# -------------------- JSON Schema --------------------
-SCHEMA: Dict[str, Any] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "AvitoItem",
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["name", "url", "price", "features", "description", "seller_rate", "seller_reviews"],
-    "properties": {
-        "name": {"type": "string"},
-        "url": {"type": "string", "format": "uri"},
-        "price": {"type": "number"},
-        "features": {"type": "string"},
-        "description": {"type": "string"},
-        "seller_rate": {"type": "number"},
-        "seller_reviews": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["review", "rate"],
-                "properties": {
-                    "review": {"type": "string"},
-                    "rate": {"type": "number"},
-                },
-            },
-        },
-    },
-}
-SCHEMA_VALIDATOR = Draft202012Validator(SCHEMA)
+HEADLESS = os.getenv("HEADLESS", "1").lower() in ("1", "true", "yes")
+BLOCK_MEDIA = os.getenv("BLOCK_MEDIA", "1").lower() in ("1", "true", "yes")
+STORAGE_STATE = os.getenv("STORAGE_STATE", str(DATA_DIR / "state.json"))
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
-# -------------------- Utils --------------------
-def jlog(level: str, msg: str, **kwargs):
-    payload = {"ts": datetime.now(tz=timezone.utc).isoformat(), "level": level.upper(), "msg": msg, **kwargs}
-    line = json.dumps(payload, ensure_ascii=False)
-    print(line)
-    with open(LOG_DIR / "run.jsonl", "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+SLOW_MIN, SLOW_MAX = 0.6, 1.6
+MAX_RETRIES = 3
 
+# -------------------- Логирование --------------------
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(tz=timezone.utc).isoformat()
 
-async def async_sleep_polite():
-    await asyncio.sleep(random.uniform(SLOW_MIN, SLOW_MAX))
+def jlog(level: str, msg: str, **kw):
+    payload = {"ts": _now(), "level": level.upper(), "msg": msg, **kw}
+    print(json.dumps(payload, ensure_ascii=False))
 
+# -------------------- Утилиты --------------------
+def _nap():
+    return asyncio.sleep(random.uniform(SLOW_MIN, SLOW_MAX))
 
-def price_to_number(text: str) -> Optional[float]:
-    if not text:
-        return None
-    digits = re.sub(r"[^\d]", "", text)
-    return float(digits) if digits else None
-
-
-def flatten_text(elements: List[str]) -> str:
-    parts = [re.sub(r"\s+", " ", t).strip() for t in elements if t and t.strip()]
-    return "\n".join([p for p in parts if p])
-
-
-def is_avito_firewall(html: str) -> bool:
-    h = html.lower()
-    return ("firewall-title" in h or "доступ ограничен" in h or "/web/1/firewallcaptcha/" in h
-            or "js-firewall-form" in h or "geetest_captcha" in h or "h-captcha" in h)
-
-
-def normalize_avito_url(u: str) -> str:
+def normalize_url(u: str) -> str:
     if not u:
         return u
     if u.startswith("//"):
@@ -131,17 +66,13 @@ def normalize_avito_url(u: str) -> str:
     if u.startswith("/"):
         u = urljoin("https://www.avito.ru", u)
     sp = urlsplit(u)
-    u = urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))  # обрезаем query и fragment
+    u = urlunsplit((sp.scheme, sp.netloc, sp.path, "", ""))  # убираем query/fragment
     u = re.sub(r"([?&])utm_[^=&]+=[^&]+", r"\1", u)
     u = re.sub(r"([?&])s=[^&]+", r"\1", u)
     return u.rstrip("?&").rstrip("#")
 
-
-def is_item_url_strict(u: str) -> bool:
-    """
-    Карточка: /<city>/<category>/<slug>_<ID>
-    Ровно 3 сегмента; последний заканчивается на _<7+ цифр>.
-    """
+def is_item_url(u: str) -> bool:
+    """Карточка: /<city>/<category>/<slug>_<ID> — ровно 3 сегмента, ID ≥7 цифр."""
     try:
         pu = urlparse(u)
         if pu.netloc not in {"avito.ru", "www.avito.ru", "m.avito.ru"}:
@@ -149,133 +80,146 @@ def is_item_url_strict(u: str) -> bool:
         parts = (pu.path or "/").strip("/").split("/")
         if len(parts) != 3:
             return False
-        last = parts[-1]
-        return bool(re.fullmatch(r".+_\d{7,}", last))
+        return bool(re.fullmatch(r".+_\d{7,}", parts[-1]))
     except Exception:
         return False
 
+def price_to_number(text: str) -> float:
+    if not text:
+        return 0.0
+    digits = re.sub(r"[^\d]", "", text)
+    return float(digits) if digits else 0.0
 
 def save_snapshot(html: str, name: str):
     p = SNAP_DIR / f"{name}.html"
-    p.write_text(html, encoding="utf-8")
+    p.write_text(html or "", encoding="utf-8")
     return str(p)
 
-# -------------------- SQLite (seen URLs) --------------------
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS seen ("
-        " url TEXT PRIMARY KEY,"
-        " dt  TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+def is_firewall(html: str) -> bool:
+    if not html:
+        return False
+    h = html.lower()
+    return any(x in h for x in (
+        "firewall-title", "доступ ограничен", "/web/1/firewallcaptcha/",
+        "js-firewall-form", "geetest_captcha", "h-captcha"
+    ))
+
+# -------------------- Прокси --------------------
+def _playwright_proxy() -> Optional[Dict[str, str]]:
+    """Готовим dict для Playwright, если PROXY_URL задан."""
+    if not PROXY_URL:
+        return None
+    # Playwright понимает server + optional username/password
+    # Разберём вручную:
+    # schema://user:pass@host:port
+    try:
+        from urllib.parse import urlparse
+        pu = urlparse(PROXY_URL)
+        server = f"{pu.scheme}://{pu.hostname}:{pu.port}"
+        out = {"server": server}
+        if pu.username:
+            out["username"] = pu.username
+        if pu.password:
+            out["password"] = pu.password
+        return out
+    except Exception:
+        # как fallback отдадим «как есть»
+        return {"server": PROXY_URL}
+
+def _httpx_client() -> httpx.AsyncClient:
+    proxies = None
+    if PROXY_URL:
+        proxies = {"http://": PROXY_URL, "https://": PROXY_URL}
+    return httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "ru-RU,ru;q=0.9"},
+        timeout=20.0,
+        proxies=proxies,
+        follow_redirects=True,
+        verify=True,
     )
-    return conn
 
-def db_is_seen(conn: sqlite3.Connection, url: str) -> bool:
-    cur = conn.execute("SELECT 1 FROM seen WHERE url = ?", (url,))
-    return cur.fetchone() is not None
-
-def db_mark_seen(conn: sqlite3.Connection, url: str):
+# -------------------- Robots (мягкая проверка) --------------------
+async def robots_soft_allow(start_url: str) -> bool:
+    """
+    Пытаемся скачать robots.txt. Если 403/ошибка — не блокируем (возвращаем True),
+    просто логируем предупреждение. Это защищает от «ложной» остановки.
+    """
     try:
-        conn.execute("INSERT OR IGNORE INTO seen(url) VALUES (?)", (url,))
-        conn.commit()
-    except Exception as e:
-        jlog("WARN", "Не удалось пометить URL в БД", error=str(e), url=url)
-
-# -------------------- Robots.txt --------------------
-async def fetch_robots_allow(domain_root: str, paths: List[str], skip_check: bool = False) -> Tuple[bool, Dict[str, bool]]:
-    if skip_check:
-        return True, {p: True for p in paths}
-    robots_url = domain_root.rstrip("/") + "/robots.txt"
-    allowed = {}
-    try:
-        async with httpx.AsyncClient(headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT) as client:
-            r = await client.get(robots_url, follow_redirects=True)
-            content = r.text if r.status_code == 200 else ""
-    except Exception as e:
-        jlog("WARN", "Не удалось скачать robots.txt; по умолчанию останавливаемся", error=str(e), robots_url=robots_url)
-        return False, {p: False for p in paths}
-
-    groups, current, ua_any = [], [], False
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.lower().startswith("user-agent"):
-            if current:
-                groups.append(current); current = []
-            ua = line.split(":", 1)[1].strip()
-            ua_any = (ua == "*")
-        elif ua_any and (line.lower().startswith("disallow") or line.lower().startswith("allow")):
-            current.append(line)
-    if current:
-        groups.append(current)
-
-    disallows, allows = [], []
-    for grp in groups:
-        for rule in grp:
-            k, v = [x.strip() for x in rule.split(":", 1)]
-            (disallows if k.lower() == "disallow" else allows).append(v)
-
-    def path_allowed(path: str) -> bool:
-        dismatch = [d for d in disallows if d and path.startswith(d)]
-        if not dismatch:
+        pu = urlparse(start_url)
+        robots_url = f"{pu.scheme}://{pu.netloc}/robots.txt"
+        async with _httpx_client() as client:
+            r = await client.get(robots_url)
+        if r.status_code != 200:
+            jlog("WARN", "robots.txt недоступен — продолжаем", status=r.status_code, robots_url=robots_url)
             return True
-        allow_over = [a for a in allows if a and path.startswith(a)]
-        return bool(allow_over and max(map(len, allow_over)) >= max(map(len, dismatch)))
+        txt = r.text
+        path = "/" + "/".join(start_url.split("/", 3)[3:]).split("?")[0]
+        if not path:
+            return True
+        # Грубая проверка: ищем явный Disallow для начала пути
+        dis = []
+        allow = []
+        ua_any = False
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("user-agent"):
+                ua = line.split(":", 1)[1].strip()
+                ua_any = (ua == "*")
+            elif ua_any and line.lower().startswith("disallow"):
+                dis.append(line.split(":", 1)[1].strip())
+            elif ua_any and line.lower().startswith("allow"):
+                allow.append(line.split(":", 1)[1].strip())
+        deny = [d for d in dis if d and path.startswith(d)]
+        if not deny:
+            return True
+        allow_over = [a for a in allow if a and path.startswith(a)]
+        ok = bool(allow_over and max(map(len, allow_over)) >= max(map(len, deny)))
+        if not ok:
+            jlog("WARN", "robots.txt: путь в зоне Disallow — продолжаем на свой риск", path=path)
+        return True  # всё равно мягко разрешаем
+    except Exception as e:
+        jlog("WARN", "robots.txt: ошибка чтения — продолжаем", error=str(e))
+        return True
 
-    for p in paths:
-        allowed[p] = path_allowed(p)
-    return all(allowed.values()), allowed
-
-# -------------------- Playwright helpers --------------------
-async def launch_browser():
+# -------------------- Playwright --------------------
+async def launch():
     pw = await async_playwright().start()
     launch_kwargs = {
         "headless": HEADLESS,
         "args": [
             "--disable-blink-features=AutomationControlled",
-            "--use-gl=swiftshader", "--enable-webgl",
             "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--window-size=1280,900",
         ],
     }
-    # внутри launch_browser()
+    browser = await pw.chromium.launch(**launch_kwargs)
 
-    browser = await (pw.chromium.launch(channel=CHROME_CHANNEL, **{
-        "headless": HEADLESS,
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--use-gl=swiftshader", "--enable-webgl",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",  # <— добавили
-        ],
-    }) if CHROME_CHANNEL else pw.chromium.launch(
-        headless=HEADLESS,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--use-gl=swiftshader", "--enable-webgl",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",  # <— добавили
-        ],
-    ))
-
-    context = await browser.new_context(
-        storage_state=STORAGE_STATE,
-        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    context_kwargs: Dict[str, Any] = dict(
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"),
         locale="ru-RU",
         timezone_id="Europe/Moscow",
         viewport={"width": 1280, "height": 900},
+        storage_state=STORAGE_STATE if Path(STORAGE_STATE).exists() else None,
     )
 
-    # щедрее таймауты
-    context.set_default_navigation_timeout(90_000)
-    context.set_default_timeout(60_000)
+    proxy = _playwright_proxy()
+    if proxy:
+        context_kwargs["proxy"] = proxy
+
+    context = await browser.new_context(**context_kwargs)
+    context.set_default_navigation_timeout(60_000)
+    context.set_default_timeout(30_000)
     await context.set_extra_http_headers({"Accept-Language": "ru-RU,ru;q=0.9"})
 
     if BLOCK_MEDIA:
         async def route_handler(route):
-            if route.request.resource_type in {"media", "font"}:
+            rt = route.request.resource_type
+            if rt in {"media", "font"}:
                 await route.abort()
             else:
                 await route.continue_()
@@ -283,139 +227,205 @@ async def launch_browser():
 
     return pw, browser, context
 
-
-async def dismiss_overlays(page) -> None:
+async def smart_goto(page, url: str) -> bool:
+    """Более устойчивое открытие страницы категории/карточки."""
     try:
-        for sel in [
-            'button:has-text("Хорошо")',
-            'button:has-text("Понятно")',
-            'button:has-text("Принять")',
-            'button:has-text("Да, верно")',
-            'button:has-text("Сохранить")',
-        ]:
-            loc = page.locator(sel)
-            if await loc.count() > 0:
-                try:
-                    await loc.first.click(timeout=1500)
-                    await async_sleep_polite()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-
-def _derive_category_slug(start_url: str) -> str:
-    try:
-        u = urlparse(start_url)
-        parts = (u.path or "/").strip("/").split("/")
-        if len(parts) >= 2 and parts[1]:
-            return parts[1]
-    except Exception:
-        pass
-    return ""
-
-
-async def scroll_collect_unseen_links(
-    page,
-    max_unseen: int,
-    start_url: str,
-    is_seen: Optional[Callable[[str], bool]] = None
-) -> List[str]:
-    """Собирает до max_unseen НЕВИДЕННЫХ ссылок на карточки, продолжая скроллить пока это возможно."""
-    seen_on_run: set = set()
-    result: List[str] = []
-
-    def want(url: str) -> bool:
-        if not is_item_url_strict(url):
-            return False
-        if url in seen_on_run:
-            return False
-        if is_seen and is_seen(url):
-            return False
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         return True
+    except Exception:
+        pass
+    # Fallback: быстрый commit → ждём DOM и якоря
+    try:
+        await page.goto(url, wait_until="commit", timeout=30_000)
+        await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+        await page.wait_for_selector("a", timeout=20_000)
+        return True
+    except Exception:
+        return False
 
-    async def harvest() -> Tuple[int, int, int]:
+async def ensure_not_firewalled(page) -> bool:
+    """Если капча/фаервол — ждём, что пользователь решит её (HEADLESS=0)."""
+    html = await page.content()
+    if not is_firewall(html):
+        return True
+    jlog("WARN", "Обнаружен firewall/captcha. Решите в окне браузера (если headful).")
+    start = time.time()
+    while time.time() - start < 180:  # 3 минуты
+        try:
+            html = await page.content()
+            if not is_firewall(html):
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    save_snapshot(html, f"captcha_{int(time.time())}")
+    return False
+
+# -------------------- Сбор ссылок из категории --------------------
+async def collect_links(page, max_links: int, start_url: str) -> List[str]:
+    result, seen = [], set()
+
+    async def harvest() -> Tuple[int, int]:
         hrefs = await page.eval_on_selector_all("a", "els => els.map(e => e.getAttribute('href') || '')")
-        total, matched_all, matched_unseen = 0, 0, 0
+        total, matched = 0, 0
         for h in hrefs:
             if not h:
                 continue
             total += 1
-            h = normalize_avito_url(h)
-            if is_item_url_strict(h):
-                matched_all += 1
-                if want(h):
-                    matched_unseen += 1
-                    seen_on_run.add(h)
-                    result.append(h)
-        return total, matched_all, matched_unseen
+            h = normalize_url(h)
+            if is_item_url(h) and h not in seen:
+                matched += 1
+                seen.add(h)
+                result.append(h)
+        return total, matched
 
-    slug = _derive_category_slug(start_url)
-    if slug:
-        try:
-            await page.wait_for_selector(f'a[href*="/{slug}/"]', timeout=15_000)
-        except Exception:
-            pass
+    total, matched = await harvest()
+    jlog("INFO", "Диагностика ссылок (первый проход)", total_anchors=total, matched=matched)
 
-    total, matched_all, _ = await harvest()
-    jlog("INFO", "Диагностика ссылок (первый проход)", total_anchors=total, matched=matched_all)
-
-    stagnant_rounds, last_len = 0, len(result)
-    while len(result) < max_unseen and stagnant_rounds < 10:
+    stagnant, last_len = 0, len(result)
+    while len(result) < max_links and stagnant < 8:
         try:
             await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
         except Exception:
             pass
-        await async_sleep_polite()
-        total, matched_all, _ = await harvest()
-        jlog("INFO", "Диагностика ссылок (скролл)", total_anchors=total, matched=matched_all, collected=len(result))
+        await _nap()
+        total, matched = await harvest()
+        jlog("INFO", "Диагностика ссылок (скролл)", total_anchors=total, matched=matched, collected=len(result))
         if len(result) == last_len:
-            stagnant_rounds += 1
+            stagnant += 1
         else:
-            stagnant_rounds, last_len = 0, len(result)
+            stagnant, last_len = 0, len(result)
 
     if not result:
         html = await page.content()
         save_snapshot(html, "category_zero_links")
 
-    return result[:max_unseen]
+    return result[:max_links]
 
-# -------------------- Reviews helpers --------------------
-RE_REV_WORD = re.compile(r"\bотзыв(?:ов|а)?\b", re.I)
-EXCLUDE_SNIPPETS = ("Вы открыли объявление в Бизнес 360",)
+# -------------------- Рейтинг и отзывы --------------------
+NUM_RE = re.compile(r"([0-5](?:[.,]\d)?)\s*(?:из\s*5)?", re.I)
 
-async def _close_noise(page) -> None:
-    """Прижимаем налипшие баннеры/тосты (Бизнес 360 и т.п.)."""
+def _num_0_5(s: str) -> Optional[float]:
+    if not s:
+        return None
+    m = NUM_RE.search(s)
+    if not m:
+        return None
     try:
-        xbtn = page.locator('button[aria-label*="Закрыть"], [role="button"]:has-text("Закрыть")')
-        if await xbtn.count():
-            try:
-                await xbtn.first.click(timeout=800)
-            except Exception:
-                pass
-        await page.evaluate("""() => {
-          const bad = [
-            '[data-marker*="business-360"]',
-            '[class*="Business360"]', '[class*="b360"]',
-            '[data-marker*="toast"]'
-          ];
-          for (const sel of bad) document.querySelectorAll(sel).forEach(n => n.remove());
-          const sticky = [...document.querySelectorAll('div')].find(d => d.textContent && d.textContent.includes('Бизнес 360'));
-          if (sticky) sticky.remove();
-        }""")
+        return max(0.0, min(5.0, float(m.group(1).replace(",", "."))))
+    except Exception:
+        return None
+
+def _extract_seller_rating(soup: BeautifulSoup) -> float:
+    # 1) Специфичный для Avito блок рейтинга на карточке
+    cont = soup.select_one('.Ww4IN.seller-info-rating') or soup.select_one('[data-marker="sellerRate"], [data-marker*="sellerRate"]')
+    if cont:
+        # Часто цифра 5,0 лежит в span рядом со звёздами
+        txt = cont.get_text(" ", strip=True)
+        v = _num_0_5(txt)
+        if v is not None:
+            return v
+        # и/или в aria-label звёзд
+        lab = cont.select_one('[aria-label*="Рейтинг"], [aria-label*="из 5"], [title*="из 5"]')
+        if lab:
+            v = _num_0_5(lab.get("aria-label") or lab.get("title") or "")
+            if v is not None:
+                return v
+
+    # 2) JSON-LD AggregateRating (редко, но вдруг)
+    try:
+        for node in soup.select('script[type="application/ld+json"]'):
+            txt = (node.get_text() or "").strip()
+            if not txt:
+                continue
+            data = json.loads(txt)
+            datas = data if isinstance(data, list) else [data]
+            for obj in datas:
+                if isinstance(obj, dict):
+                    if obj.get("@type") == "AggregateRating":
+                        v = _num_0_5(str(obj.get("ratingValue", "")))
+                        if v is not None:
+                            return v
+                    ag = obj.get("aggregateRating")
+                    if isinstance(ag, dict):
+                        v = _num_0_5(str(ag.get("ratingValue", "")))
+                        if v is not None:
+                            return v
     except Exception:
         pass
 
+    # 3) Любой элемент с aria/title/alt «из 5»
+    for el in soup.select('[aria-label*="из 5"], [title*="из 5"]'):
+        v = _num_0_5(el.get("aria-label") or el.get("title") or "")
+        if v is not None:
+            return v
+
+    # 4) Фоллбек: по тексту всей страницы
+    v = _num_0_5(soup.get_text(" ", strip=True))
+    return float(v) if v is not None else 0.0
+
+def _attrs_text_chain(node) -> str:
+    parts = []
+    for el in [node, *node.find_all(True, recursive=True)]:
+        for a in ("aria-label", "title", "alt"):
+            if el.has_attr(a) and el.get(a):
+                parts.append(str(el.get(a)))
+    return " | ".join(parts)
+
+EXCLUDE_SNIPPETS = ("Вы открыли объявление в Бизнес 360",)
+
+def _parse_reviews_from_html(html: str, limit: int = 50) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "lxml")
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    # Берём живые контейнеры + явные review-маркеры / звёзды
+    containers = soup.select('[data-marker*="review"], [data-marker*="feedback"], article, section, li, div')
+    for c in containers:
+        txt = c.get_text(" ", strip=True)
+        if not txt or len(txt) < 40:
+            continue
+        if any(s in txt for s in EXCLUDE_SNIPPETS):
+            continue
+        # фильтр на «похожесть» на отзыв
+        if not ("Сделка состоялась" in txt or re.search(r"\b(Покупатель|Продавец)\b", txt, re.I) or re.search(r"\bиз\s*5\b", txt)):
+            continue
+
+        # Оценка: сначала по атрибутам (aria/title/alt)
+        rating = _num_0_5(_attrs_text_chain(c))
+        # затем по тексту
+        if rating is None:
+            rating = _num_0_5(txt)
+        # затем по вложенным звёздам Avito (data-marker="review(...)/score/star-x")
+        if rating is None:
+            star_nodes = c.select('[data-marker*="/score/star-"], [class*="star"]')
+            for sn in star_nodes:
+                s = (sn.get("aria-label") or sn.get("title") or sn.get_text(" ", strip=True) or "")
+                v = _num_0_5(s)
+                if v is not None:
+                    rating = v
+                    break
+
+        h = hash(txt)
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append({"review": txt, "rate": float(rating or 0.0)})
+        if len(out) >= limit:
+            break
+
+    return out
+
 async def _open_reviews_ui(page) -> str:
     """
-    Пытаемся открыть «Отзывы». Возвращаем:
-    - 'dialog'  — открылась модалка;
-    - 'page'    — перешли в профиль/вкладку «Отзывы»;
-    - ''        — не удалось.
+    Пытаемся открыть «Отзывы»:
+      - модалка (возврат 'dialog')
+      - переход на страницу профиля (возврат 'page')
+      - иначе ''.
     """
-    # 1) Ссылка/кнопка «Отзывы»
+    # 1) Ссылка/кнопка «Отзывы» / «N отзывов»
     try:
-        loc = page.locator("a,button").filter(has_text=RE_REV_WORD)
+        loc = page.locator('a:has-text("отзыв"), button:has-text("отзыв"), [data-marker="rating-caption/rating"]', has_text=re.compile("отзыв", re.I))
         if await loc.count():
             try:
                 await loc.first.click(timeout=3000, force=True)
@@ -428,6 +438,7 @@ async def _open_reviews_ui(page) -> str:
                 await page.wait_for_selector('text=/Отзывы о пользователе/i', timeout=5000)
                 return "dialog"
             except Exception:
+                # возможно, открылся профиль
                 pass
     except Exception:
         pass
@@ -447,108 +458,9 @@ async def _open_reviews_ui(page) -> str:
         pass
     return ""
 
-def _num_0_5(s: str) -> Optional[float]:
-    if not s:
-        return None
-    m = re.search(r"([0-5](?:[.,]\d)?)\s*(?:из\s*5)?", s, flags=re.I)
-    if not m:
-        return None
-    v = m.group(1).replace(",", ".")
-    try:
-        f = float(v);  return max(0.0, min(5.0, f))
-    except Exception:
-        return None
-
-def _attrs_text_chain(node) -> str:
-    parts = []
-    for el in [node, *node.find_all(True, recursive=True)]:
-        for a in ("aria-label", "title", "alt"):
-            if el.has_attr(a) and el.get(a):
-                parts.append(str(el.get(a)))
-    return " | ".join(parts)
-
-def _parse_reviews_from_html(html: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Сначала точный путь: ищем оценки через data-marker="review(X)/score".
-    Если нет — включаем эвристики.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    reviews: List[Dict[str, Any]] = []
-    seen = set()
-
-    # 1) Точная разметка Avito
-    star_nodes = soup.select('[data-marker^="review("][data-marker$="/score"]')
-    for sn in star_nodes:
-        dm = sn.get("data-marker", "")
-        m = re.match(r"review\(([\d.,]+)\)/score", dm)
-        rating = float(m.group(1).replace(",", ".")) if m else 0.0
-
-        container = (sn.find_parent("article")
-                     or sn.find_parent("li")
-                     or sn.find_parent("section")
-                     or sn.find_parent("div")
-                     or sn)
-        txt = container.get_text(" ", strip=True)
-        txt = re.sub(r"Рейтинг\s+\d(\s|$)", " ", txt, flags=re.I)
-        if not txt or len(txt) < 40:
-            continue
-        if any(s in txt for s in EXCLUDE_SNIPPETS):
-            continue
-
-        h = hash(txt)
-        if h in seen:
-            continue
-        seen.add(h)
-        reviews.append({"review": txt, "rate": float(max(0.0, min(5.0, rating)))})
-        if len(reviews) >= limit:
-            return reviews
-
-    # 2) Эвристики
-    containers = soup.select('[data-marker*="review"], [data-marker*="feedback"], article, section, li')
-    for c in containers:
-        if len(reviews) >= limit:
-            break
-        txt = c.get_text(" ", strip=True)
-        if not txt or len(txt) < 40:
-            continue
-        if any(s in txt for s in EXCLUDE_SNIPPETS):
-            continue
-        if not ("Сделка состоялась" in txt
-                or re.search(r"\b(Покупатель|Продавец)\b", txt, re.I)
-                or re.search(r"\bиз\s*5\b", txt)):
-            continue
-
-        rating = None
-        attrs_str = _attrs_text_chain(c)
-        rating = _num_0_5(attrs_str)
-        if rating is None:
-            rating = _num_0_5(txt)
-        if rating is None:
-            star_nodes = c.select('[class*="star"], [aria-label*="звезд"], [title*="звезд"]')
-            for sn in star_nodes:
-                s = (sn.get("aria-label") or sn.get("title") or sn.get_text(" ", strip=True) or "")
-                v = _num_0_5(s)
-                if v is not None:
-                    rating = v
-                    break
-
-        h = hash(txt)
-        if h in seen:
-            continue
-        seen.add(h)
-        reviews.append({"review": txt, "rate": float(rating or 0.0)})
-
-    return reviews[:limit]
-
-async def _collect_reviews(page, limit: int = 50) -> List[Dict[str, Any]]:
-    await _close_noise(page)
-    mode = await _open_reviews_ui(page)
-    if not mode:
-        return []
-
-    reviews: List[Dict[str, Any]] = []
+async def _collect_reviews(page, mode: str, limit: int = 50) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     stagnant = 0
-
     for _ in range(12):
         if mode == "dialog":
             html = await page.evaluate("""
@@ -560,112 +472,46 @@ async def _collect_reviews(page, limit: int = 50) -> List[Dict[str, Any]]:
         else:
             html = await page.content()
 
-        batch = _parse_reviews_from_html(html, limit=limit-len(reviews))
-
-        before = len(reviews)
+        batch = _parse_reviews_from_html(html, limit=limit - len(out))
+        before = len(out)
         for b in batch:
-            if b not in reviews:
-                reviews.append(b)
-                if len(reviews) >= limit:
+            if b not in out:
+                out.append(b)
+                if len(out) >= limit:
                     break
 
-        if len(reviews) >= limit:
+        if len(out) >= limit:
             break
 
-        stagnant = stagnant + 1 if len(reviews) == before else 0
+        stagnant = stagnant + 1 if len(out) == before else 0
         if stagnant >= 3:
             break
 
         try:
             if mode == "dialog":
                 await page.evaluate("""
-                  () => {
-                    const dlg = document.querySelector('[role="dialog"]');
-                    if (dlg) dlg.scrollTop = dlg.scrollHeight;
-                  }
+                    () => { const d = document.querySelector('[role="dialog"]');
+                            if (d) d.scrollTop = d.scrollHeight; }
                 """)
             else:
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
         except Exception:
             break
+        await _nap()
+    return out
 
-        await async_sleep_polite()
-
-    return reviews
-
-# -------------------- Rating helper (общий рейтинг продавца) --------------------
-def _extract_seller_rating(soup: BeautifulSoup) -> float:
-    """
-    Точный парсинг рейтинга продавца:
-    1) .seller-info-rating .CiqtH (например '5,0')
-    2) Контекст вокруг [data-marker="sellerRate"]
-    3) Fallback: JSON-LD / aria-label / 'из 5' / общий текст
-    """
-    el = soup.select_one('.seller-info-rating .CiqtH')
-    if el:
-        v = _num_0_5(el.get_text(strip=True))
-        if v is not None:
-            return float(v)
-
-    sr = soup.select_one('[data-marker="sellerRate"]')
-    if sr:
-        parent = sr.parent or sr
-        text_ctx = parent.get_text(" ", strip=True)
-        v = _num_0_5(text_ctx)
-        if v is not None:
-            return float(v)
-
-    # JSON-LD
-    try:
-        for node in soup.select('script[type="application/ld+json"]'):
-            txt = (node.get_text() or "").strip()
-            if not txt:
-                continue
-            data = json.loads(txt)
-            datas = data if isinstance(data, list) else [data]
-            for obj in datas:
-                if not isinstance(obj, dict):
-                    continue
-                if obj.get("@type") == "AggregateRating" and obj.get("ratingValue"):
-                    v = _num_0_5(str(obj["ratingValue"]))
-                    if v is not None:
-                        return float(v)
-                ag = obj.get("aggregateRating")
-                if isinstance(ag, dict) and ag.get("ratingValue"):
-                    v = _num_0_5(str(ag["ratingValue"]))
-                    if v is not None:
-                        return float(v)
-    except Exception:
-        pass
-
-    for node in soup.select('[aria-label], [title], [alt]'):
-        s = (node.get("aria-label") or node.get("title") or node.get("alt") or "").strip()
-        if not s:
-            continue
-        if ("из 5" in s) or ("рейтинг" in s.lower()) or ("оцен" in s.lower()):
-            v = _num_0_5(s)
-            if v is not None:
-                return float(v)
-
-    v = _num_0_5(soup.get_text(" ", strip=True))
-    return float(v) if v is not None else 0.0
-
-# -------------------- Item extraction --------------------
-async def extract_item_fields(page_url: str, context) -> Optional[Dict[str, Any]]:
+# -------------------- Парсинг карточки --------------------
+async def parse_item(page_url: str, context) -> Optional[Dict[str, Any]]:
     import html as htmllib
 
-    clean_url = normalize_avito_url(page_url)
+    url = normalize_url(page_url)
     page = await context.new_page()
-
-    try:
-        await page.goto(clean_url, wait_until="domcontentloaded", timeout=30_000)
-    except PWTimeoutError:
-        jlog("WARN", "Таймаут навигации к карточке", url=clean_url)
-        await page.close(); return None
-    except Exception as e:
-        jlog("WARN", "Ошибка навигации к карточке", url=clean_url, error=str(e))
+    ok = await smart_goto(page, url)
+    if not ok:
+        jlog("WARN", "Таймаут навигации к карточке", url=url)
         await page.close(); return None
 
+    # ждём что-то осмысленное (title/meta) ИЛИ firewall
     try:
         await page.wait_for_selector(
             'meta[property="og:title"], [data-marker="item-view/title"], h1, '
@@ -673,40 +519,21 @@ async def extract_item_fields(page_url: str, context) -> Optional[Dict[str, Any]
             timeout=15_000
         )
     except Exception:
-        jlog("WARN", "Селектор карточки не дождался — парсим как есть", url=clean_url)
+        jlog("WARN", "Селектор карточки не дождался — парсим как есть", url=url)
 
     await page.wait_for_timeout(600)
+    if not await ensure_not_firewalled(page):
+        html_fw = await page.content()
+        save_snapshot(html_fw, f"captcha_item_{int(time.time())}")
+        await page.close(); return None
+
     html = await page.content()
-
-    if is_avito_firewall(html):
-        jlog("WARN", "В карточке появилась капча/фаервол", url=clean_url)
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: input(">>> В карточке есть капча. Пройдите её и нажмите Enter... "))
-        try:
-            await context.storage_state(path=STORAGE_STATE)
-            jlog("INFO", "Состояние (cookies) сохранено после карточки", path=STORAGE_STATE)
-        except Exception:
-            pass
-        await page.reload(wait_until="domcontentloaded")
-        try:
-            await page.wait_for_selector('meta[property="og:title"], h1', timeout=20_000)
-        except Exception:
-            pass
-        html = await page.content()
-        if is_avito_firewall(html):
-            save_snapshot(html, f"captcha_{int(time.time()*1000)}")
-            jlog("ERROR", "Капча в карточке не пройдена", url=clean_url)
-            await page.close(); return None
-
     soup = BeautifulSoup(html, "lxml")
 
     canonical = soup.select_one('link[rel="canonical"]')
     canonical_url = canonical["href"].strip() if canonical and canonical.has_attr("href") else page.url
 
+    # title
     name = ""
     mt = soup.find("meta", {"property": "og:title"})
     if mt and mt.get("content"):
@@ -716,22 +543,22 @@ async def extract_item_fields(page_url: str, context) -> Optional[Dict[str, Any]
         if tnode:
             name = tnode.get_text(strip=True)
 
-    price_num: Optional[float] = None
+    # price
+    price_num: float = 0.0
     mp = soup.find("meta", {"property": "product:price:amount"})
     if mp and mp.get("content"):
         price_num = price_to_number(mp["content"])
-    if price_num is None:
+    if not price_num:
         pnode = soup.select_one('[itemprop="price"], [data-marker="item-view/price"], meta[itemprop="price"]')
         if pnode:
             text = pnode.get("content") or pnode.get_text(" ", strip=True)
             price_num = price_to_number(text)
-    if price_num is None:
+    if not price_num:
         m = re.search(r"(\d[\d\s]{1,}\d)\s*₽", soup.get_text(" ", strip=True))
         if m:
             price_num = price_to_number(m.group(1))
-    if price_num is None:
-        price_num = 0.0
 
+    # description
     description = ""
     try:
         for node in soup.select('script[type="application/ld+json"]'):
@@ -752,6 +579,7 @@ async def extract_item_fields(page_url: str, context) -> Optional[Dict[str, Any]
         if el:
             description = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
 
+    # features
     features_texts: List[str] = []
     for cont in (soup.select('[data-marker*="item-params"]') or soup.select("ul.params-list") or []):
         items = cont.select("li")
@@ -764,199 +592,98 @@ async def extract_item_fields(page_url: str, context) -> Optional[Dict[str, Any]
             txt = cont.get_text("\n", strip=True)
             if txt:
                 features_texts.append(txt)
-    features_flat = flatten_text(features_texts)
+    features_flat = "\n".join([re.sub(r"\s+", " ", t).strip() for t in features_texts if t.strip()])
 
+    # seller rating
     seller_rate = _extract_seller_rating(soup)
 
+    # отзывы (если удастся открыть)
     reviews: List[Dict[str, Any]] = []
     try:
-        reviews = await _collect_reviews(page, limit=50)
+        mode = await _open_reviews_ui(page)
+        if mode:
+            reviews = await _collect_reviews(page, mode=mode, limit=50)
     except Exception as e:
-        jlog("WARN", "Ошибка при получении отзывов", url=page_url, error=str(e))
+        jlog("WARN", "Отзывы: ошибка сбора", error=str(e), url=url)
 
-    record = {
-        "name": (name or "").strip(),
+    await page.close()
+    return {
+        "name": name or "",
         "url": canonical_url,
         "price": float(price_num or 0.0),
-        "features": (features_flat or "").strip(),
-        "description": (description or "").strip(),
+        "features": features_flat,
+        "description": description or "",
         "seller_rate": float(seller_rate or 0.0),
         "seller_reviews": reviews or [],
     }
 
-    errs = [e.message for e in sorted(SCHEMA_VALIDATOR.iter_errors(record), key=str)]
-    if errs:
-        jlog("ERROR", "Невалидная запись по схеме", url=clean_url, errors=errs)
-        save_snapshot(html, f"invalid_item_{int(time.time())}")
-        await page.close(); return None
-
-    await page.close()
-    return record
-async def _open_category_or_fail(page, start_url: str, slug_hint: str, captcha_mode: str = "auto") -> bool:
+# -------------------- Главный поток --------------------
+async def run(start_url: str, max_items: int, skip_robots: bool = True):
     """
-    Открывает страницу категории «по-умному»:
-    - первый goto ждёт только commit (быстрый ответ сервера)
-    - далее крутим цикл: проверяем firewall и наличие ссылок карточек
-    Возвращает True, если категория готова; False — если не удалось.
+    Открывает категорию/поиск, собирает до max_items карточек, парсит их
+    и сохраняет по одной строке JSON в data/avito_items.jsonl (перезаписывает).
     """
-    # 1) быстрый заход
-    try:
-        await page.goto(start_url, wait_until="commit", timeout=45_000)
-    except Exception as e:
-        jlog("WARN", "Goto(commit) не успел", url=start_url, error=str(e))
+    # robots — мягкая проверка (никогда не блокируем по 403)
+    if skip_robots:
+        await robots_soft_allow(start_url)
 
-    # 2) ждём контент каталога или firewall (до ~60с)
-    t0 = time.time()
-    last_err = ""
-    while time.time() - t0 < 60:
-        try:
-            html = await page.content()
-        except Exception as e:
-            last_err = str(e)
-            await asyncio.sleep(1.5)
-            continue
-
-        if "js-firewall-form" in html.lower() or "h-captcha" in html.lower() or "firewall-title" in html.lower():
-            jlog("WARN", "Обнаружен firewall на категории")
-            # если есть возможность — даём шанс вручную решить (если HEADLESS=0)
-            if os.getenv("CAPTCHA_MODE", "manual").lower() == "manual" and (os.getenv("HEADLESS", "1") in ("0","false","no")):
-                try:
-                    await page.bring_to_front()
-                except Exception:
-                    pass
-                jlog("WARN", "Решите капчу в окне браузера и вернитесь в консоль")
-                # ждём, пока уйдёт firewall
-                solved = False
-                t1 = time.time()
-                while time.time() - t1 < 180:
-                    html2 = await page.content()
-                    if not ("js-firewall-form" in html2.lower() or "h-captcha" in html2.lower() or "firewall-title" in html2.lower()):
-                        solved = True
-                        break
-                    await asyncio.sleep(2)
-                if not solved:
-                    save_snapshot(html, "category_firewall_unsolved")
-                    return False
-                # иначе продолжаем цикл, чтобы дождаться контента
-            else:
-                save_snapshot(html, "category_firewall_headless")
-                return False
-
-        # контент каталога обычно даёт ссылки вида /<slug>/..._1234567
-        if slug_hint:
-            locator = page.locator(f'a[href*="/{slug_hint}/"]')
-            try:
-                if await locator.count() > 0:
-                    return True
-            except Exception:
-                pass
-
-        # как минимум, если на странице есть <a> с id-паттерном карточки — тоже ок
-        anchors = re.findall(r'href="([^"]+_\d{7,})"', html)
-        if anchors:
-            return True
-
-        await asyncio.sleep(1.2)
-
-    # таймаут ожидания
-    try:
-        html = await page.content()
-        save_snapshot(html, "category_open_timeout")
-    except Exception:
-        pass
-    if last_err:
-        jlog("ERROR", "Категория не открылась", error=last_err)
-    return False
-# -------------------- Main flow --------------------
-async def run(start_url: str, max_items: int, skip_robots: bool = False):
-    domain_root = "https://www.avito.ru"
-    try:
-        path_part = "/" + "/".join(start_url.split("/", 3)[3:]).split("?")[0]
-        if path_part == "/":
-            path_part = "/moskva/"
-    except Exception:
-        path_part = "/moskva/"
-
-    ok, rules = await fetch_robots_allow(domain_root, [path_part], skip_check=skip_robots)
-    if not ok:
-        jlog("ERROR", "robots.txt запрещает путь или не прочитан. Останавливаемся.", rules=rules)
-        print("ROBOTS_BLOCK", rules); return
-
-    # 1) Подготовка БД
-    conn = db_connect()
-
-    # 2) Перезаписываем JSONL на каждый запуск
+    # обнуляем результат
     OUTPUT_JSONL.write_text("", encoding="utf-8")
     jlog("INFO", "Файл результата обнулён", out=str(OUTPUT_JSONL))
 
-    pw, browser, context = await launch_browser()
+    pw, browser, context = await launch()
     page = await context.new_page()
-    page.set_default_navigation_timeout(90_000)
-
-    slug = _derive_category_slug(start_url)
-
-    ok_open = await _open_category_or_fail(page, start_url, slug_hint=slug)
-    if not ok_open:
-        jlog("ERROR", "Категория не открылась (после commit-режима)", url=start_url)
-        await browser.close();
-        await pw.stop();
-        conn.close();
+    ok = await smart_goto(page, start_url)
+    if not ok:
+        jlog("ERROR", "Категория не открылась (commit/DOM fallback)", url=start_url)
+        await browser.close(); await pw.stop()
         return
 
-    await dismiss_overlays(page)
+    if not await ensure_not_firewalled(page):
+        html = await page.content()
+        save_snapshot(html, f"captcha_category_{int(time.time())}")
+        jlog("ERROR", "Капча на категории не решена", url=start_url)
+        await browser.close(); await pw.stop()
+        return
 
-    html0 = (await page.content()).lower()
-    if "js-firewall-form" in html0 or "h-captcha" in html0:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: input(">>> На категории/поиске есть капча. Пройдите и нажмите Enter... "))
-        try:
-            await context.storage_state(path=STORAGE_STATE)
-            jlog("INFO", "Состояние (cookies) сохранено", path=STORAGE_STATE)
-        except Exception:
-            pass
+    links = await collect_links(page, max_items, start_url)
+    jlog("INFO", "Собрали ссылки", total=len(links), links=links)
 
-    # Собираем именно НЕВИДЕННЫЕ ссылки (учитывая SQLite)
-    links = await scroll_collect_unseen_links(
-        page,
-        max_unseen=max_items,
-        start_url=start_url,
-        is_seen=lambda u: db_is_seen(conn, normalize_avito_url(u))
-    )
-
-    jlog("INFO", "Собрали ссылки", total=len(links), unique=len(set(links)), skipped_by_db=0, links=links)
-
-    results_count = 0
+    results = 0
     with open(OUTPUT_JSONL, "a", encoding="utf-8") as out:
         for href in links:
             tries, rec = 0, None
             while tries < MAX_RETRIES:
                 tries += 1
-                rec = await extract_item_fields(href, context)
+                try:
+                    rec = await parse_item(href, context)
+                except Exception as e:
+                    jlog("WARN", "Ошибка парсинга карточки", error=str(e), url=href)
+                    rec = None
                 if rec:
                     break
-                backoff = min(6, 1.5 ** tries) + random.uniform(0.0, 0.6)
-                jlog("WARN", "Повторная попытка карточки", url=href, attempt=tries, sleep=round(backoff, 2))
+                backoff = min(6, 1.5 ** tries) + random.uniform(0, 0.6)
+                jlog("WARN", "Повтор карточки", attempt=tries, sleep=round(backoff, 2), url=href)
                 await asyncio.sleep(backoff)
+
             if rec:
                 out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                results_count += 1
-                db_mark_seen(conn, normalize_avito_url(rec.get("url") or href))
+                results += 1
             else:
-                jlog("ERROR", "Не удалось извлечь карточку после повторов", url=href)
-            await async_sleep_polite()
+                jlog("ERROR", "Не удалось извлечь карточку", url=href)
 
-    await browser.close(); await pw.stop(); conn.close()
-    jlog("INFO", "Готово", extracted=results_count, out=str(OUTPUT_JSONL))
+            await _nap()
 
-# -------------------- CLI --------------------
-def parse_args(argv: List[str]):
-    import argparse
-    p = argparse.ArgumentParser(description="Avito scraper (category/search -> items -> seller reviews)")
-    p.add_argument("--start-url", required=True, help="Страница категории или поиска Avito")
-    p.add_argument("--max-items", type=int, default=2, help="Сколько НЕВИДЕННЫХ карточек извлечь (по умолчанию 2)")
-    p.add_argument("--skip-robots-check", action="store_true", help="Пропустить проверку robots.txt (не рекомендуется)")
-    return p.parse_args(argv)
+    await browser.close(); await pw.stop()
+    jlog("INFO", "Готово", extracted=results, out=str(OUTPUT_JSONL))
 
+
+# Локальный тест:
 if __name__ == "__main__":
-    args = parse_args(sys.argv[1:])
-    asyncio.run(run(args.start_url, args.max_items, skip_robots=args.skip_robots_check))
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--start-url", required=True)
+    p.add_argument("--max-items", type=int, default=2)
+    p.add_argument("--no-robots", action="store_true")
+    args = p.parse_args()
+    asyncio.run(run(args.start_url, args.max_items, skip_robots=not args.no_robots))
