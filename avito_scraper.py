@@ -291,7 +291,7 @@ def _extract_seller_rating(soup: BeautifulSoup) -> float:
             for obj in datas:
                 if isinstance(obj, dict):
                     if obj.get("@type") == "AggregateRating":
-                        v = _num_0_5(str(obj.get("ratingValue","")));  if v is not None: return v
+                        v = _num_0_5(str(obj.get("ratingValue",""))); if v is not None: return v
                     ag = obj.get("aggregateRating")
                     if isinstance(ag, dict):
                         v = _num_0_5(str(ag.get("ratingValue","")));    if v is not None: return v
