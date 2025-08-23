@@ -308,7 +308,44 @@ def _num_0_5(s: str) -> Optional[float]:
         return None
 
 def _extract_seller_rating(soup: BeautifulSoup) -> float:
-    # 1) JSON-LD
+    """
+    Сначала пробуем достать число из блока продавца на карточке:
+    <div class="seller-info-rating"> <span>5,0</span> ... data-marker="sellerRate" ... </div>
+    Только если там нет — пробуем JSON-LD и общие упоминания "из 5".
+    """
+    # 0) Специальный блок рядом со звёздами
+    #   — ищем числовой <span> рядом с data-marker="sellerRate"
+    try:
+        container = None
+        rate_widget = soup.select_one('[data-marker="sellerRate"]')
+        if rate_widget:
+            container = rate_widget.find_parent(True)
+        if not container:
+            container = soup.select_one('.seller-info-rating')
+        if container:
+            # В этом блоке обычно есть отдельный <span> с "5,0" или "4.8"
+            num_span = None
+            # сначала попробуем явные числа в непосредственных span'ах
+            for sp in container.find_all('span', recursive=True):
+                txt = (sp.get_text(strip=True) or '').replace(',', '.')
+                if re.fullmatch(r'[0-5](?:\.\d)?', txt):
+                    num_span = txt
+                    break
+            if num_span:
+                try:
+                    val = float(num_span)
+                    if 0.0 <= val <= 5.0:
+                        return val
+                except Exception:
+                    pass
+            # если не нашли — берём строку всего контейнера (там часто есть "5,0")
+            v = _num_0_5(container.get_text(" ", strip=True))
+            if v is not None:
+                return v
+    except Exception:
+        pass
+
+    # 1) JSON-LD AggregateRating / aggregateRating
     try:
         for node in soup.select('script[type="application/ld+json"]'):
             txt = (node.get_text() or "").strip()
@@ -331,7 +368,7 @@ def _extract_seller_rating(soup: BeautifulSoup) -> float:
     except Exception:
         pass
 
-    # 2) aria-label/title/alt
+    # 2) Общий fallback: любые aria/alt/title или текст с "из 5"
     for el in soup.select('[aria-label], [title], [alt]'):
         s = (el.get("aria-label") or el.get("title") or el.get("alt") or "").strip()
         if not s:
@@ -339,20 +376,13 @@ def _extract_seller_rating(soup: BeautifulSoup) -> float:
         if ("из 5" in s) or ("рейтинг" in s.lower()) or ("оцен" in s.lower()):
             v = _num_0_5(s)
             if v is not None:
+                # Важно: игнорируем отдельные звёзды "Рейтинг 1/2/3/4/5".
+                # Если это "звезда №1", рядом часто есть цифра без "из 5", пропустим такие.
+                if "из 5" not in s and re.fullmatch(r"Рейтинг\s*[1-5]\b", s):
+                    continue
                 return v
 
-    # 3) Текст около «Отзывы/оценк/рейтинг»
-    hint_blocks = soup.find_all(string=re.compile(r"(отзыв|оценк|рейтинг)", re.I))
-    for hb in hint_blocks:
-        try:
-            ctx = hb.parent.get_text(" ", strip=True)
-            v = _num_0_5(ctx)
-            if v is not None:
-                return v
-        except Exception:
-            pass
-
-    # 4) Fallback
+    # 3) Ещё один общий fallback по тексту страницы
     v = _num_0_5(soup.get_text(" ", strip=True))
     return float(v) if v is not None else 0.0
 
@@ -402,27 +432,47 @@ def _parse_reviews_from_html(html: str, limit: int = 50) -> List[Dict[str, Any]]
     return out
 
 async def _open_reviews_ui(page) -> str:
-    # Пытаемся открыть «Отзывы» (модалка или вкладка профиля)
+    """
+    Пытаемся открыть отзывы одним из трёх способов:
+      A) ссылка/кнопка с текстом "отзыв"
+      B) ссылка с data-marker="rating-caption/rating" (часто "26 отзывов")
+      C) профиль продавца -> вкладка "Отзывы"
+    Возвращает: "dialog" | "page" | "" (не нашли)
+    """
+    # A) Любая ссылка/кнопка с текстом "отзыв"
     try:
-        loc = page.locator(
-            'a:has-text("отзыв"), button:has-text("отзыв"), [data-marker="rating-caption/rating"]'
-        )
+        loc = page.locator("a, button").filter(has_text=re.compile(r"отзыв", re.I))
         if await loc.count():
-            try:
-                await loc.first.click(timeout=3000, force=True)
-            except Exception:
-                try:
-                    await loc.first.dblclick(timeout=3000, force=True)
-                except Exception:
-                    pass
-            try:
-                await page.wait_for_selector('text=/Отзывы о пользователе/i', timeout=5000)
+            await loc.first.click(timeout=4000)
+            await page.wait_for_timeout(600)
+            if await page.locator('[role="dialog"]').count():
                 return "dialog"
+            # могли перейти на страницу
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=7000)
             except Exception:
                 pass
+            return "page"
     except Exception:
         pass
 
+    # B) Специальная плашка рядом с рейтингом
+    try:
+        cap = page.locator('[data-marker="rating-caption/rating"]')
+        if await cap.count():
+            await cap.first.click(timeout=4000, force=True)
+            await page.wait_for_timeout(600)
+            if await page.locator('[role="dialog"]').count():
+                return "dialog"
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=7000)
+            except Exception:
+                pass
+            return "page"
+    except Exception:
+        pass
+
+    # C) Профиль продавца -> вкладка "Отзывы"
     try:
         prof = page.locator('a[href*="/profile"], a[href*="/user/"], a:has-text("Профиль"), a:has-text("Пользователь")')
         if await prof.count():
@@ -435,37 +485,55 @@ async def _open_reviews_ui(page) -> str:
                 return "page"
     except Exception:
         pass
+
     return ""
 
 async def _collect_reviews(page, mode: str, limit: int = 50) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     stagnant = 0
-    for _ in range(12):
+    for _ in range(14):  # чуть больше итераций
         if mode == "dialog":
             html = await page.evaluate("""
-                () => { const dlg = document.querySelector('[role="dialog"]');
-                        return dlg ? dlg.innerHTML : document.documentElement.innerHTML; }
+                () => {
+                  const dlg = document.querySelector('[role="dialog"]');
+                  return dlg ? dlg.innerHTML : document.documentElement.innerHTML;
+                }
             """)
         else:
             html = await page.content()
+
         batch = _parse_reviews_from_html(html, limit=limit - len(out))
         before = len(out)
         for b in batch:
             if b not in out:
                 out.append(b)
-                if len(out) >= limit: break
-        if len(out) >= limit: break
+                if len(out) >= limit:
+                    break
+
+        if len(out) >= limit:
+            break
+
         stagnant = stagnant + 1 if len(out) == before else 0
-        if stagnant >= 3: break
+        if stagnant >= 4:
+            break
+
+        # Прокрутка источника
         try:
             if mode == "dialog":
-                await page.evaluate("""() => { const d = document.querySelector('[role="dialog"]'); if (d) d.scrollTop = d.scrollHeight; }""")
+                await page.evaluate("""
+                    () => {
+                      const d = document.querySelector('[role="dialog"]');
+                      if (d) d.scrollTop = d.scrollHeight;
+                    }
+                """)
             else:
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
         except Exception:
             break
+
         await _nap()
     return out
+
 
 # -------------------- Карточка --------------------
 async def parse_item(page_url: str, context) -> Optional[Dict[str, Any]]:
@@ -550,9 +618,13 @@ async def parse_item(page_url: str, context) -> Optional[Dict[str, Any]]:
 
     reviews: List[Dict[str, Any]] = []
     try:
+        # Дадим страничке чуть устаканиться — на headless иногда блок едет лениво.
+        await page.wait_for_timeout(800)
         mode = await _open_reviews_ui(page)
         if mode:
             reviews = await _collect_reviews(page, mode=mode, limit=50)
+        else:
+            jlog("INFO", "Отзывы: не нашли вход (ок)", url=url)
     except Exception as e:
         jlog("WARN", "Отзывы: ошибка сбора", error=str(e), url=url)
 
