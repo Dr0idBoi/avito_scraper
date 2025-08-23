@@ -11,21 +11,18 @@ from typing import Optional, Tuple
 from telegram.request import HTTPXRequest
 from dotenv import load_dotenv
 
-# 1) Загружаем .env до импорта avito_scraper
-#    Явно указываем путь, чтобы IDE/разные cwd не мешали.
+# 1) Подхватываем .env до импорта скрейпера
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-# 2) Для локального теста можно оставить дефолт 0, но НЕ переопределять, если в .env уже задано
+# 2) Если HEADLESS не задан во внешней среде — используем headful для локальной отладки
 if "HEADLESS" not in os.environ:
-    os.environ["HEADLESS"] = "0"   # локально хотим окно; на сервере просто не задавай это
+    os.environ["HEADLESS"] = "0"
 
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# 3) Теперь импортируем скрейпер — он увидит уже загруженный HEADLESS=0
-import avito_scraper
+import avito_scraper  # увидит уже загруженные переменные окружения
 
-# дальше как было...
 TOKEN = os.getenv("TG_TOKEN", "").strip()
 if not TOKEN:
     raise SystemExit("TG_TOKEN не задан")
@@ -35,13 +32,11 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/bot").strip() or "/bot"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8080"))
 
-# ⚠️ ЭТУ СТРОКУ УДАЛИ: она ломает твоё HEADLESS=0 из .env
-# os.environ.setdefault("HEADLESS", "1")
-
 EXPORTS_DIR = Path("./exports")
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-# ---------- utils ----------
+
 URL_RE = re.compile(r"https?://(?:www\.)?avito\.ru/[^\s]+", re.I)
+
 
 def _parse_args_from_text(text: str) -> Tuple[Optional[str], int]:
     url = None
@@ -52,10 +47,11 @@ def _parse_args_from_text(text: str) -> Tuple[Optional[str], int]:
     nums = re.findall(r"\b(\d{1,3})\b", text or "")
     if nums:
         try:
-            count = max(1, min(50, int(nums[-1])))
+            count = max(1, min(100, int(nums[-1])))
         except Exception:
             pass
     return url, count
+
 
 def _jsonl_to_array_bytes(jsonl_path: Path) -> bytes:
     arr = []
@@ -71,27 +67,32 @@ def _jsonl_to_array_bytes(jsonl_path: Path) -> bytes:
                     pass
     return json.dumps(arr, ensure_ascii=False, indent=2).encode("utf-8")
 
-# ---------- handlers ----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пришли ссылку на категорию Avito и количество объявлений.\n"
         "Пример: https://www.avito.ru/moskva/velosipedy?cd=1 3\n"
-        "Или командой: /scrape <url> <count>"
+        "Или командой: /scrape <url> <count>\n\n"
+        "Ранее обработанные объявления будут автоматически пропущены."
     )
+
 
 async def scrape_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args) if context.args else (update.message.text or "")
     await _handle_scrape(update, context, text)
 
+
 async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     await _handle_scrape(update, context, text)
 
-# лок на чат, чтобы не запускать несколько сборов параллельно
+
+# Лок на чат, чтобы не запускать несколько сборов параллельно
 _chat_locks: dict[int, "asyncio.Lock"] = {}
 
+
 async def _handle_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    import asyncio  # локальный импорт, чтобы не мешал при синхронном main()
+    import asyncio
     chat_id = update.effective_chat.id
     url, count = _parse_args_from_text(text)
 
@@ -126,8 +127,10 @@ async def _handle_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
             bio = io.BytesIO(payload)
             bio.name = fname
 
-            await update.message.reply_document(document=InputFile(bio, filename=fname),
-                                                caption="Готово ✅ Вот JSON.")
+            await update.message.reply_document(
+                document=InputFile(bio, filename=fname),
+                caption="Готово ✅ Вот JSON."
+            )
 
             try:
                 (EXPORTS_DIR / fname).write_bytes(payload)
@@ -141,17 +144,16 @@ async def _handle_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
             except Exception:
                 pass
 
-# ---------- entrypoint ----------
+
 def main() -> None:
     # На время инициализации Telegram-клиента отключаем прокси из ENV,
     # чтобы httpx внутри PTB не пытался идти через них.
     saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")}
 
     try:
-        req = HTTPXRequest()  # в твоей версии нет allow_env_proxies
+        req = HTTPXRequest()
         app = Application.builder().token(TOKEN).request(req).build()
     finally:
-        # Если хочешь — верни переменные. Это не обязательно.
         for k, v in saved.items():
             if v is not None:
                 os.environ[k] = v
