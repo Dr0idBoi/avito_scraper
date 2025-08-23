@@ -212,7 +212,10 @@ async def launch():
         viewport={"width": 1280, "height": 900},
         storage_state=STORAGE_STATE if Path(STORAGE_STATE).exists() else None,
     )
-
+    await context.set_extra_http_headers({
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Referer": "https://www.google.com/",
+    })
     # Геолокация Россия
     try:
         await context.grant_permissions(["geolocation"], origin="https://www.avito.ru")
@@ -787,7 +790,10 @@ async def run(start_url: str, max_items: int, skip_robots: bool = True):
 
     pw, browser, context = await launch()
     page = await context.new_page()
-
+    warm = await context.new_page()
+    await smart_goto(warm, "https://www.avito.ru/")
+    await warm.wait_for_timeout(1200)
+    await warm.close()
     ok = await smart_goto(page, start_url)
     if not ok:
         jlog("ERROR", "Категория не открылась (commit/DOM fallback)", url=start_url)
