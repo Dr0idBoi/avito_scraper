@@ -8,28 +8,38 @@ import json
 import time
 from pathlib import Path
 from typing import Optional, Tuple
-
+from telegram.request import HTTPXRequest
 from dotenv import load_dotenv
+
+# 1) Загружаем .env до импорта avito_scraper
+#    Явно указываем путь, чтобы IDE/разные cwd не мешали.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
+
+# 2) Для локального теста можно оставить дефолт 0, но НЕ переопределять, если в .env уже задано
+if "HEADLESS" not in os.environ:
+    os.environ["HEADLESS"] = "0"   # локально хотим окно; на сервере просто не задавай это
+
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-import avito_scraper  # твой серверный скрейпер
+# 3) Теперь импортируем скрейпер — он увидит уже загруженный HEADLESS=0
+import avito_scraper
 
-load_dotenv()
+# дальше как было...
 TOKEN = os.getenv("TG_TOKEN", "").strip()
 if not TOKEN:
     raise SystemExit("TG_TOKEN не задан")
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # если пусто — используем long polling
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/bot").strip() or "/bot"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8080"))
 
-os.environ.setdefault("HEADLESS", "1")
+# ⚠️ ЭТУ СТРОКУ УДАЛИ: она ломает твоё HEADLESS=0 из .env
+# os.environ.setdefault("HEADLESS", "1")
 
 EXPORTS_DIR = Path("./exports")
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-
 # ---------- utils ----------
 URL_RE = re.compile(r"https?://(?:www\.)?avito\.ru/[^\s]+", re.I)
 
@@ -133,14 +143,24 @@ async def _handle_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
 
 # ---------- entrypoint ----------
 def main() -> None:
-    app = Application.builder().token(TOKEN).build()
+    # На время инициализации Telegram-клиента отключаем прокси из ENV,
+    # чтобы httpx внутри PTB не пытался идти через них.
+    saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")}
+
+    try:
+        req = HTTPXRequest()  # в твоей версии нет allow_env_proxies
+        app = Application.builder().token(TOKEN).request(req).build()
+    finally:
+        # Если хочешь — верни переменные. Это не обязательно.
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scrape", scrape_cmd))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), any_text))
 
     if WEBHOOK_URL:
-        # Блокирующий запуск webhook — без await
         app.run_webhook(
             listen=HOST,
             port=PORT,
@@ -149,8 +169,8 @@ def main() -> None:
             drop_pending_updates=True,
         )
     else:
-        # Блокирующий запуск long polling — без await
         app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()

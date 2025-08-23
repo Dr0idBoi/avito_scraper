@@ -3,10 +3,14 @@
 
 """
 Avito category/search -> items scraper (Playwright + BS4)
-— Поддержка прокси из .env (PROXY_URL), совместима с разными версиями httpx
+
+— Прокси из .env (PROXY_URL), httpx совместим и со старыми версиями
 — Мягкая проверка robots.txt (403/ошибка не блокирует запуск)
-— Устойчивое открытие страниц (commit→ожидания)
-— Числовой рейтинг продавца и оценка каждого отзыва
+— CHROME_CHANNEL=chrome: запуск через реальный Google Chrome (меньше капчи)
+— Лёгкий stealth (webdriver off, languages/platform и т.п.)
+— Геолокация, RU-локаль/таймзона
+— В headless не режем шрифты/картинки на старте (BLOCK_MEDIA управляет только media)
+— Числовой рейтинг продавца + оценка каждого отзыва
 — JSONL перезаписывается на каждый запуск: data/avito_items.jsonl
 """
 
@@ -22,7 +26,7 @@ from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
+from playwright.async_api import async_playwright
 
 # -------------------- Папки/настройки --------------------
 DATA_DIR = Path("./data")
@@ -33,17 +37,14 @@ for d in (DATA_DIR, SNAP_DIR):
 OUTPUT_JSONL = DATA_DIR / "avito_items.jsonl"
 
 HEADLESS = os.getenv("HEADLESS", "1").lower() in ("1", "true", "yes")
-BLOCK_MEDIA = os.getenv("BLOCK_MEDIA", "1").lower() in ("1", "true", "yes")
+# На старте лучше НЕ блокировать картинки/шрифты — это триггерит антиботы
+BLOCK_MEDIA = os.getenv("BLOCK_MEDIA", "0").lower() in ("1", "true", "yes")
 STORAGE_STATE = os.getenv("STORAGE_STATE", str(DATA_DIR / "state.json"))
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+CHROME_CHANNEL = os.getenv("CHROME_CHANNEL", "").strip()  # обычно "chrome"
 
 SLOW_MIN, SLOW_MAX = 0.6, 1.6
 MAX_RETRIES = 3
-
-# Если httpx старый и не понимает proxies, будем использовать env-переменные
-if PROXY_URL:
-    os.environ.setdefault("HTTP_PROXY", PROXY_URL)
-    os.environ.setdefault("HTTPS_PROXY", PROXY_URL)
 
 # -------------------- Лог --------------------
 def _now():
@@ -100,7 +101,7 @@ def _playwright_proxy() -> Optional[Dict[str, str]]:
     try:
         pu = urlparse(PROXY_URL)
         server = f"{pu.scheme}://{pu.hostname}:{pu.port}"
-        out = {"server": server}
+        out: Dict[str, str] = {"server": server}
         if pu.username: out["username"] = pu.username
         if pu.password: out["password"] = pu.password
         return out
@@ -108,14 +109,19 @@ def _playwright_proxy() -> Optional[Dict[str, str]]:
         return {"server": PROXY_URL}
 
 def _httpx_client() -> httpx.AsyncClient:
+    """
+    Для robots.txt и т.п. Если нужна SOCKS — ставь httpx[socks].
+    """
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "ru-RU,ru;q=0.9"}
     try:
-        # новые версии httpx
         proxies = {"http://": PROXY_URL, "https://": PROXY_URL} if PROXY_URL else None
-        return httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True, verify=True, proxies=proxies)
+        return httpx.AsyncClient(headers=headers, timeout=20.0,
+                                 follow_redirects=True, verify=True, proxies=proxies)
     except TypeError:
-        # старые версии httpx — без параметра proxies, берут из env
-        return httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True, verify=True)
+        # Старый httpx без параметра proxies — возьмёт из переменных окружения
+        # (если очень нужно — перед запуском можно выставить HTTP(S)_PROXY)
+        return httpx.AsyncClient(headers=headers, timeout=20.0,
+                                 follow_redirects=True, verify=True)
 
 # -------------------- Robots (мягко) --------------------
 async def robots_soft_allow(start_url: str) -> bool:
@@ -127,7 +133,7 @@ async def robots_soft_allow(start_url: str) -> bool:
         if r.status_code != 200:
             jlog("WARN", "robots.txt недоступен — продолжаем", status=r.status_code, robots_url=robots_url)
             return True
-        # грубая проверка (всё равно не блокируем)
+        # Очень грубая проверка, всё равно НЕ блокируем
         txt = r.text
         path = "/" + "/".join(start_url.split("/", 3)[3:]).split("?")[0]
         dis, allow, ua_any = [], [], False
@@ -142,7 +148,7 @@ async def robots_soft_allow(start_url: str) -> bool:
                 allow.append(line.split(":",1)[1].strip())
         deny = [d for d in dis if d and path.startswith(d)]
         if deny:
-            jlog("WARN", "robots.txt: путь в зоне Disallow — продолжаем на свой риск", path=path)
+            jlog("WARN", "robots.txt: путь в Disallow — продолжаем на свой риск", path=path)
         return True
     except Exception as e:
         jlog("WARN", "robots.txt: ошибка чтения — продолжаем", error=str(e))
@@ -159,13 +165,17 @@ async def launch():
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--window-size=1280,900",
+            "--lang=ru-RU",
         ],
     }
     proxy = _playwright_proxy()
     if proxy:
-        launch_kwargs["proxy"] = proxy  # ВАЖНО: прокси задаём при launch()
+        launch_kwargs["proxy"] = proxy
 
-    browser = await pw.chromium.launch(**launch_kwargs)
+    if CHROME_CHANNEL:
+        browser = await pw.chromium.launch(channel=CHROME_CHANNEL, **launch_kwargs)
+    else:
+        browser = await pw.chromium.launch(**launch_kwargs)
 
     context = await browser.new_context(
         user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -176,13 +186,33 @@ async def launch():
         viewport={"width": 1280, "height": 900},
         storage_state=STORAGE_STATE if Path(STORAGE_STATE).exists() else None,
     )
+
+    # Разрешим геолокацию и поставим RU-координаты
+    try:
+        await context.grant_permissions(["geolocation"], origin="https://www.avito.ru")
+        await context.set_geolocation({"latitude": 55.751244, "longitude": 37.618423})
+    except Exception:
+        pass
+
+    # Лёгкий stealth
+    await context.add_init_script("""
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru','en-US','en']});
+Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+try {
+  Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+  Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+} catch(e) {}
+""")
+
     context.set_default_navigation_timeout(60_000)
     context.set_default_timeout(30_000)
     await context.set_extra_http_headers({"Accept-Language": "ru-RU,ru;q=0.9"})
 
+    # Не душим картинки/шрифты. При желании можно убрать только media.
     if BLOCK_MEDIA:
         async def route_handler(route):
-            if route.request.resource_type in {"media", "font"}:
+            if route.request.resource_type in {"media"}:
                 await route.abort()
             else:
                 await route.continue_()
@@ -208,7 +238,12 @@ async def ensure_not_firewalled(page) -> bool:
     html = await page.content()
     if not is_firewall(html):
         return True
-    jlog("WARN", "Обнаружен firewall/captcha. Решите в окне браузера (если не headless).")
+    # В headless не ждём руками — сразу возврат False (менять сессию/обновить state)
+    if HEADLESS:
+        return False
+
+    # В headful дадим шанс решить вручную
+    jlog("WARN", "Обнаружен firewall/captcha. Решите в окне браузера.")
     start = time.time()
     while time.time() - start < 180:
         try:
@@ -273,13 +308,6 @@ def _num_0_5(s: str) -> Optional[float]:
         return None
 
 def _extract_seller_rating(soup: BeautifulSoup) -> float:
-    """
-    Пытаемся достать общий рейтинг продавца максимально надёжно:
-    1) JSON-LD AggregateRating / aggregateRating
-    2) Любые aria-label/title/alt с текстом про рейтинг/«из 5»
-    3) Текст рядом с блоком 'Отзывы' / 'оценок' / 'рейтинг'
-    4) Fallback — первое число 0..5 на странице
-    """
     # 1) JSON-LD
     try:
         for node in soup.select('script[type="application/ld+json"]'):
@@ -291,12 +319,10 @@ def _extract_seller_rating(soup: BeautifulSoup) -> float:
             for obj in datas:
                 if not isinstance(obj, dict):
                     continue
-                # Прямой AggregateRating
                 if obj.get("@type") == "AggregateRating":
                     v = _num_0_5(str(obj.get("ratingValue", "")))
                     if v is not None:
                         return v
-                # Вложенный aggregateRating
                 ag = obj.get("aggregateRating")
                 if isinstance(ag, dict):
                     v = _num_0_5(str(ag.get("ratingValue", "")))
@@ -315,7 +341,7 @@ def _extract_seller_rating(soup: BeautifulSoup) -> float:
             if v is not None:
                 return v
 
-    # 3) Ближайший текст к словам «Отзывы/оценк/рейтинг»
+    # 3) Текст около «Отзывы/оценк/рейтинг»
     hint_blocks = soup.find_all(string=re.compile(r"(отзыв|оценк|рейтинг)", re.I))
     for hb in hint_blocks:
         try:
@@ -327,8 +353,7 @@ def _extract_seller_rating(soup: BeautifulSoup) -> float:
             pass
 
     # 4) Fallback
-    page_text = soup.get_text(" ", strip=True)
-    v = _num_0_5(page_text)
+    v = _num_0_5(soup.get_text(" ", strip=True))
     return float(v) if v is not None else 0.0
 
 def _attrs_text_chain(node) -> str:
@@ -349,32 +374,38 @@ def _parse_reviews_from_html(html: str, limit: int = 50) -> List[Dict[str, Any]]
     containers = soup.select('[data-marker*="review"], [data-marker*="feedback"], article, section, li, div')
     for c in containers:
         txt = c.get_text(" ", strip=True)
-        if not txt or len(txt) < 40:         continue
-        if any(s in txt for s in EXCLUDE_SNIPPETS): continue
+        if not txt or len(txt) < 40:
+            continue
+        if any(s in txt for s in EXCLUDE_SNIPPETS):
+            continue
         if not ("Сделка состоялась" in txt or re.search(r"\b(Покупатель|Продавец)\b", txt, re.I) or re.search(r"\bиз\s*5\b", txt)):
             continue
 
         rating = _num_0_5(_attrs_text_chain(c))
-        if rating is None: rating = _num_0_5(txt)
+        if rating is None:
+            rating = _num_0_5(txt)
         if rating is None:
             for sn in c.select('[data-marker*="/score/star-"], [class*="star"]'):
                 s = (sn.get("aria-label") or sn.get("title") or sn.get_text(" ", strip=True) or "")
                 v = _num_0_5(s)
                 if v is not None:
-                    rating = v; break
+                    rating = v
+                    break
 
         h = hash(txt)
-        if h in seen: continue
+        if h in seen:
+            continue
         seen.add(h)
         out.append({"review": txt, "rate": float(rating or 0.0)})
-        if len(out) >= limit: break
+        if len(out) >= limit:
+            break
     return out
 
 async def _open_reviews_ui(page) -> str:
+    # Пытаемся открыть «Отзывы» (модалка или вкладка профиля)
     try:
         loc = page.locator(
-            'a:has-text("отзыв"), button:has-text("отзыв"), [data-marker="rating-caption/rating"]',
-            has_text=re.compile("отзыв", re.I)
+            'a:has-text("отзыв"), button:has-text("отзыв"), [data-marker="rating-caption/rating"]'
         )
         if await loc.count():
             try:
@@ -554,8 +585,14 @@ async def run(start_url: str, max_items: int, skip_robots: bool = True):
 
     if not await ensure_not_firewalled(page):
         save_snapshot(await page.content(), f"captcha_category_{int(time.time())}")
-        jlog("ERROR", "Капча на категории не решена", url=start_url)
+        jlog("ERROR", "Капча на категории (headless). Нужен новый state или другой sticky-прокси", url=start_url)
         await browser.close(); await pw.stop(); return
+    else:
+        # Категория открылась — сохраняем актуальные куки/ls
+        try:
+            await context.storage_state(path=STORAGE_STATE)
+        except Exception:
+            pass
 
     links = await collect_links(page, max_items, start_url)
     jlog("INFO", "Собрали ссылки", total=len(links), links=links)
@@ -584,7 +621,7 @@ async def run(start_url: str, max_items: int, skip_robots: bool = True):
     await browser.close(); await pw.stop()
     jlog("INFO", "Готово", extracted=results, out=str(OUTPUT_JSONL))
 
-# Локальный тест
+# -------------------- CLI --------------------
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
