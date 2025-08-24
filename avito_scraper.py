@@ -63,6 +63,210 @@ def jlog(level: str, msg: str, **kw):
 # -------------------- Вспомогательное --------------------
 def _nap(): return asyncio.sleep(random.uniform(SLOW_MIN, SLOW_MAX))
 
+def _split_review_blocks(soup: BeautifulSoup) -> List[BeautifulSoup]:
+    """
+    Возвращает список контейнеров, каждый из которых соответствует одному отзыву.
+    Стратегия:
+      - сначала блоки с [itemprop=review] или содержащие [itemprop=reviewBody]
+      - затем элементы с маркерами review/feedback
+      - затем article/li/div, где встречаются дата/роль/характерные слова
+    """
+    blocks = []
+
+    # a) Явные schema.org
+    for el in soup.select('[itemprop="review"]'):
+        blocks.append(el)
+    for body in soup.select('[itemprop="reviewBody"]'):
+        # поднимаем до ближайшего article/li/div
+        p = body
+        while p and p.name not in ("article", "li", "div", "section"):
+            p = p.parent
+        if p and p not in blocks:
+            blocks.append(p)
+
+    # b) Маркеры интерфейса
+    for el in soup.select('[data-marker*="review"], [data-marker*="feedback"]'):
+        # ограничим до минимального осмысленного контейнера
+        p = el
+        depth = 0
+        while p and depth < 4 and p.name not in ("article", "li", "div", "section"):
+            p = p.parent; depth += 1
+        if p and p not in blocks:
+            blocks.append(p)
+
+    # c) Эвристика: контейнеры с датами/ролями
+    heur = []
+    for el in soup.find_all(["article", "li", "div", "section"]):
+        txt = el.get_text(" ", strip=True)
+        if not txt or len(txt) < 30:
+            continue
+        has_date = bool(RE_DATE.search(txt))
+        has_role = bool(re.search(r"\b(Покупатель|Продавец)\b", txt, re.I))
+        if has_date or has_role or ("Сделка состоялась" in txt):
+            heur.append(el)
+    # Уберём крупные родительские дубликаты (оставим «самые нижние»)
+    res = []
+    for el in heur:
+        if any(el is p or el in p.descendants for p in blocks):
+            continue
+        if any(el in q.descendants for q in heur if q is not el):
+            continue
+        res.append(el)
+
+    # Итоговый список с приоритетом явных разметок
+    return blocks + res
+
+RU_MONTHS = (
+    "января","февраля","марта","апреля","мая","июня",
+    "июля","августа","сентября","октября","ноября","декабря"
+)
+RE_DATE = re.compile(rf"\b\d{{1,2}}\s+(?:{'|'.join(RU_MONTHS)})\s*(\d{{4}})?\b", re.I)
+
+def _extract_seller_name(soup: BeautifulSoup) -> str:
+    for sel in [
+        '[data-marker="seller-info/name"]',
+        'a[data-marker="seller-link/link"]',
+        'a[href*="/profile/"]',
+        'a[href*="/user/"]',
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            nm = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+            if nm and len(nm) >= 2:
+                return nm
+    lab = soup.select_one('[aria-label*="Продавец"], [aria-label*="продавец"]')
+    return re.sub(r"\s+", " ", lab.get_text(" ", strip=True)) if lab else ""
+
+
+def _find_reviews_root(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+    # В модалке/странице отзывов обычно есть заголовок «Отзывы» и контейнер списка
+    candidates = []
+    for h in soup.select('h1,h2,h3'):
+        t = (h.get_text(" ", strip=True) or "").lower()
+        if "отзыв" in t and "о модели" not in t:
+            candidates.append(h)
+    # если есть явные маркеры списка
+    lists = soup.select(
+        '[itemprop="review"], [itemprop="reviewBody"], '
+        '[data-marker*="review"], [data-marker*="feedback"], ul, ol, section, article'
+    )
+    if candidates:
+        # берём ближайший общий контейнер
+        h = candidates[0]
+        # поднимаемся чуть вверх, чтобы охватить список
+        node = h
+        for _ in range(3):
+            if node and node.parent: node = node.parent
+        return node or soup
+    # fallback: если много reviewBody — берём их общий предок
+    if lists:
+        return soup
+    return None
+
+def _guess_reviews_urls(seller_link: str) -> List[str]:
+    base = normalize_url(seller_link or "")
+    if not base:
+        return []
+    urls = set()
+    urls.add(base.rstrip("/") + "/reviews")
+    urls.add(re.sub(r"/profile(/|$)", "/profile/", base).rstrip("/") + "/reviews")
+    urls.add(re.sub(r"/user(s)?(/|$)", r"/user\1/", base).rstrip("/") + "/reviews")
+    urls.add(base.rstrip("/") + "/otzyvy")
+    return [normalize_url(u) for u in urls]
+
+def _pick_review_text(block: BeautifulSoup, seller_name: str) -> str:
+    """
+    Достаём главный абзац/фразу из блока, отбрасывая:
+      - имя/дату, «Покупатель/Продавец», «Сделка состоялась»
+      - ответы продавца (по имени/шаблонам)
+      - однословные/очень короткие/служебные фразы
+    """
+    # 1) приоритет schema.org
+    body = block.select_one('[itemprop="reviewBody"]')
+    if body:
+        txt = re.sub(r"\s+", " ", body.get_text(" ", strip=True)).strip()
+        txt = _strip_seller_reply_from_block(txt, seller_name)
+        if len(txt) >= 20:
+            return txt
+
+    # 2) собрать кандидаты из p/div/span
+    candidates: List[str] = []
+    for el in block.find_all(["p", "div", "span"], recursive=True):
+        t = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+        if not t or len(t) < 10:
+            continue
+        # вырезаем очевидные не-тексты
+        low = t.lower()
+        if any(b in low for b in ("покупатель", "продавец", "сделка состоялась")):
+            continue
+        # «Имя Фамилия 12 декабря 2024» — не тело
+        if RE_DATE.search(t) and len(t.split()) <= 6:
+            continue
+        # короткие заголовки/лейблы
+        if len(t) < 20 and not any(ch in t for ch in ".,!?:;") and len(t.split()) < 5:
+            continue
+        candidates.append(t)
+
+    if not candidates:
+        return ""
+
+    # 3) вырежем из кандидатов «ответ продавца» и мусор
+    clean: List[str] = []
+    for t in candidates:
+        t2 = _strip_seller_reply_from_block(t, seller_name)
+        if not t2 or len(t2) < 20:
+            continue
+        if any(bad.lower() in t2.lower() for bad in EXCLUDE_SNIPPETS):
+            continue
+        clean.append(t2)
+
+    if not clean:
+        return ""
+
+    # 4) Отдаём самый содержательный (макс. длина/слова)
+    clean.sort(key=lambda s: (len(s.split()), len(s)), reverse=True)
+    return clean[0]
+
+
+def _looks_like_reviews_context(html: str, url: str = "") -> bool:
+    h = (html or "").lower()
+    u = (url or "").lower()
+    if "/reviews" in u:
+        return True
+    # Есть явная разметка отзывов?
+    if ('itemprop="reviewbody"' in h) or ('data-marker="review' in h) or ('data-marker="feedback' in h):
+        return True
+    # Заголовок/сигнальные слова
+    if "отзывы" in h and "о модели" not in h:
+        return True
+    # Много дат → похоже на ленту отзывов
+    months = ("января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря")
+    if sum(h.count(m) for m in months) >= 3:
+        return True
+    return False
+
+def _is_seller_reply(txt: str, seller_name: str) -> bool:
+    if not txt: return False
+    t = txt.strip()
+    if "ответ продавца" in t.lower() or t.lower().startswith("продавец"):
+        return True
+    if seller_name:
+        rx = rf"^{re.escape(seller_name).replace(' ','\\s+')}\\s+\\d{{1,2}}\\s+({'|'.join(RU_MONTHS)})\\b"
+        if re.search(rx, t, re.I):  # «<Имя> 12 июня …»
+            return True
+    if len(t) <= 220 and any(x in t for x in ("Спасибо за", "Благодарим", "Будем рады", "Спасибо большое")):
+        return True
+    return False
+
+def _strip_seller_reply_from_block(txt: str, seller_name: str) -> str:
+    if not txt: return ""
+    t = re.sub(r"\s+", " ", txt).strip()
+    if not seller_name:
+        return re.split(r"(?:Ответ продавца|Продавец)\b", t, 1)[0].strip()
+    rx = rf"(?:Ответ продавца|Продавец|{re.escape(seller_name)})\s+\d{{1,2}}\s+({'|'.join(RU_MONTHS)})\b"
+    parts = re.split(rx, t, 1, flags=re.I)
+    return (parts[0] if parts else t).strip()
+
 def normalize_url(u: str) -> str:
     if not u:
         return u
@@ -355,6 +559,50 @@ def _num_0_5(s: str) -> Optional[float]:
     except Exception:
         return None
 
+def _extract_review_body_from_block(text: str, seller_name: str) -> str:
+    """
+    Берём «хвост» после «Сделка состоялась …»; вычищаем товары/служебные куски; режем ответы продавца.
+    """
+    if not text:
+        return ""
+    t = re.sub(r"\s+", " ", text).strip()
+    # Отрезаем всё после возможного «ответа продавца»
+    t = _strip_seller_reply_from_block(t, seller_name)
+
+    # ищем «Сделка состоялась»
+    if "Сделка состоялась" in t:
+        tail = t.split("Сделка состоялась", 1)[1]
+    else:
+        # fallback: если есть роль/дата — работаем с исходником
+        tail = t
+
+    # убираем ведущие маркеры/буллеты
+    tail = re.sub(r"^[\s•·,;:|-]+", " ", tail).strip()
+
+    # режем по буллетам/«·» и крупным разделителям
+    parts = [p.strip(" .·•\u2022") for p in re.split(r"(?:[•·]\s*|\s{2,}| — )", tail) if p.strip()]
+    # отбрасываем короткие/служебные и товарные названия
+    candidates = []
+    for p in parts:
+        if any(bad.lower() in p.lower() for bad in EXCLUDE_SNIPPETS):
+            continue
+        if re.search(r"\b(Покупатель|Продавец)\b", p, re.I):
+            continue
+        # короткие товарные названия часто < 60 символов
+        if re.search(r"\b(контейнер|iphone|телефон|морской|фут|gb|гб)\b", p, re.I) and len(p) < 60:
+            continue
+        if len(p) >= 20:
+            candidates.append(p)
+
+    if not candidates:
+        body = tail.strip()
+    else:
+        # берём самый содержательный фрагмент
+        body = max(candidates, key=len).strip()
+
+    body = _strip_seller_reply_from_block(body, seller_name)
+    return body.strip()
+
 def _extract_seller_rating(soup: BeautifulSoup) -> float:
     try:
         container = None
@@ -424,152 +672,169 @@ def _attrs_text_chain(node) -> str:
                 parts.append(str(el.get(a)))
     return " | ".join(parts)
 
-EXCLUDE_SNIPPETS = ("Вы открыли объявление в Бизнес 360",)
+EXCLUDE_SNIPPETS = (
+    # общий мусор/шапки
+    "Вы открыли объявление в Бизнес 360",
+    "Рейтинг — это среднее арифметическое оценок пользователей",
+    "на основании", "Написать отзыв", "Оставить отзыв",
+    "Пожаловаться", "Подробнее", "Показать ещё", "Показать больше",
+    # профильный мусор
+    "Активные", "Завершённые", "Поиск в профиле", "Ещё", "О компании", "Адрес", "Оплата",
+    # не брать «отзывы о модели»
+    "Отзывы о модели", "отзывов о модели",
+)
 
-def _parse_reviews_from_html(html: str, limit: int = 50) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "lxml")
-    out: List[Dict[str, Any]] = []
-    seen = set()
+def _parse_reviews_from_html(html: str, limit: int = 50, seller_name: str = "") -> List[Dict[str, str]]:
+    """
+    Стабильный парсинг ТОЛЬКО текстов отзывов покупателей.
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
 
-    # максимально широкие контейнеры + отсев по ключевым словам
-    containers = soup.select(
-        '[data-marker*="review"], [data-marker*="feedback"], '
-        'article, section, li[data-marker], li, div[data-marker]'
-    )
-    for c in containers:
-        txt = c.get_text(" ", strip=True)
-        if not txt or len(txt) < 40:
-            continue
-        if any(s in txt for s in EXCLUDE_SNIPPETS):
-            continue
-        if not ("Сделка состоялась" in txt or re.search(r"\b(Покупатель|Продавец)\b", txt, re.I) or re.search(r"\bиз\s*5\b", txt)):
-            # всё равно дадим шанс, если видим «Отзыв» в подзаголовке
-            if not re.search(r"отзыв", txt, re.I):
+    if not _looks_like_reviews_context(html):
+        return []
+
+    # 0) JSON-LD reviewBody — быстрый сбор (если есть)
+    try:
+        for node in soup.select('script[type="application/ld+json"]'):
+            payload = (node.get_text() or "").strip()
+            if not payload:
                 continue
+            data = json.loads(payload)
+            datas = data if isinstance(data, list) else [data]
+            for obj in datas:
+                if not isinstance(obj, dict):
+                    continue
+                # одиночный review
+                if obj.get("@type") in ("Review", "UserReview"):
+                    rb = obj.get("reviewBody") or obj.get("description")
+                    if rb:
+                        t = _strip_seller_reply_from_block(str(rb), seller_name)
+                        t = re.sub(r"\s+", " ", t).strip()
+                        if t and len(t) >= 20:
+                            low = t.lower()
+                            if not any(b in low for b in ( "отзывы о модели", "на основании" )):
+                                nt = t.lower()
+                                if nt not in seen:
+                                    seen.add(nt); out.append({"review": t})
+                # коллекция review[]
+                if "review" in obj:
+                    revs = obj["review"]
+                    arr = revs if isinstance(revs, list) else [revs]
+                    for r in arr:
+                        if isinstance(r, dict):
+                            rb = r.get("reviewBody") or r.get("description")
+                            if rb:
+                                t = _strip_seller_reply_from_block(str(rb), seller_name)
+                                t = re.sub(r"\s+", " ", t).strip()
+                                if t and len(t) >= 20:
+                                    nt = t.lower()
+                                    if nt not in seen:
+                                        seen.add(nt); out.append({"review": t})
+                        if len(out) >= limit:
+                            return out[:limit]
+    except Exception:
+        pass  # JSON-LD может быть «грязным»
 
-        rating = _num_0_5(_attrs_text_chain(c)) or _num_0_5(txt)
-        if rating is None:
-            for sn in c.select('[data-marker*="/score/star-"], [class*="star"], [aria-label*="из 5"]'):
-                s = (sn.get("aria-label") or sn.get("title") or sn.get_text(" ", strip=True) or "")
-                v = _num_0_5(s)
-                if v is not None:
-                    rating = v
-                    break
+    if len(out) >= limit:
+        return out[:limit]
 
-        h = hash(txt)
-        if h in seen:
+    # 1) DOM-блоки отзывов
+    blocks = _split_review_blocks(soup)
+    for b in blocks:
+        t = _pick_review_text(b, seller_name)
+        if not t:
             continue
-        seen.add(h)
-        out.append({"review": txt, "rate": float(rating or 0.0)})
+        nt = t.lower()
+        if nt in seen:
+            continue
+        seen.add(nt)
+        out.append({"review": t})
         if len(out) >= limit:
             break
-    return out
+
+    return out[:limit]
 
 
 async def _open_reviews_ui(page):
     """
-    Пытаемся попасть в отзывы:
-      1) Поп-ап на карточке (кнопка/ссылка «Отзывы»).
-      2) Отдельная страница отзывов продавца (если ссылка открывает её).
-      3) Профиль продавца → вкладка «Отзывы».
-    Возвращает (mode, target_page):
-      mode: "dialog" | "page" | "" (если не удалось)
-      target_page: Page для чтения (если отдельная страница), иначе исходная страница.
+    Попасть в отзывы: 1) диалог (role=dialog), 2) клик «Отзывы/Рейтинг» с перехватом popup вкладки,
+    3) профиль продавца → вкладка «Отзывы» или прямые /reviews.
+    Возвращает (mode, target_page). Используем Playwright `context.expect_page` для новых вкладок,
+    ARIA role=dialog для модалки. :contentReference[oaicite:5]{index=5}
     """
-    # небольшая пауза на гидрацию
-    try:
-        await page.wait_for_timeout(600)
-    except Exception:
-        pass
+    import re as _re
+    await page.wait_for_timeout(700)
 
-    # если модалка уже открыта
     try:
         if await page.locator('[role="dialog"]').count():
             return "dialog", page
     except Exception:
         pass
 
-    # A) Любой элемент «отзыв»
     try:
-        loc = page.locator('a,button').filter(has_text=re.compile(r'отзыв', re.I))
-        if await loc.count():
+        variants = [
+            'a[data-marker="rating-caption/rating"]',
+            '[data-marker*="rating"] a',
+            '[data-marker*="seller"] a:has-text("Отзывы")',
+            'a:has-text("Отзывы")', 'button:has-text("Отзывы")',
+            'a:has-text("Рейтинг")', 'button:has-text("Рейтинг")',
+        ]
+        for sel in variants:
+            loc = page.locator(sel).first
+            if not await loc.count():
+                continue
             try:
-                await loc.first.click(timeout=4000, force=True)
+                await loc.scroll_into_view_if_needed(timeout=3000)
             except Exception:
-                # JS-клик на случай перекрытий
+                pass
+            new_page = None
+            try:
+                async with page.context.expect_page() as ep:
+                    await loc.click(timeout=4000, force=True)
+                new_page = await ep.value    # новая вкладка/окно с отзывами
+            except Exception:
                 try:
-                    await page.evaluate('(el)=>el.click()', await loc.first.element_handle())
+                    await loc.click(timeout=4000, force=True)
                 except Exception:
-                    pass
-            await page.wait_for_timeout(500)
+                    try:
+                        el = await loc.element_handle()
+                        if el: await page.evaluate('(e)=>e.click()', el)
+                    except Exception:
+                        pass
 
+            await page.wait_for_timeout(600)
             if await page.locator('[role="dialog"]').count():
                 return "dialog", page
 
-            # Возможно, открылись отзывы в том же табе
+            target = new_page or page
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=7000)
-                return "page", page
+                await target.wait_for_load_state("domcontentloaded", timeout=8000)
             except Exception:
                 pass
+            # проверяем характерные признаки страницы отзывов
+            if await target.locator('h1:has-text("Отзывы"), h2:has-text("Отзывы"), :has-text("Сделка состоялась")').count():
+                return "page", target
     except Exception:
         pass
 
-    # B) Якорь «оценка/кол-во отзывов» data-marker="rating-caption/rating"
+    # Профиль продавца → вкладка/URL «Отзывы»
     try:
-        sel = 'a[data-marker="rating-caption/rating"]'
-        a = page.locator(sel).first
-        if await a.count():
-            href = await a.get_attribute("href")
-            if href:
-                href = normalize_url(href)
-                # Снимем target, чтобы открыть в этом же контексте (или в новом табе)
-                try:
-                    await page.evaluate("""sel => { const el = document.querySelector(sel); if (el) el.removeAttribute('target'); }""", sel)
-                except Exception:
-                    pass
-                try:
-                    await a.click(timeout=4000, force=True)
-                    await page.wait_for_timeout(500)
-                except Exception:
-                    pass
-
-                # Если модалка
-                if await page.locator('[role="dialog"]').count():
-                    return "dialog", page
-
-                # Иначе откроем отдельную страницу во вторичной вкладке
-                ext = await page.context.new_page()
-                ok = await smart_goto(ext, href)
-                if ok:
-                    try:
-                        await ext.wait_for_load_state("domcontentloaded", timeout=10000)
-                    except Exception:
-                        pass
-                    return "page", ext
-                else:
-                    await ext.close()
-    except Exception:
-        pass
-
-    # C) Профиль продавца → вкладка «Отзывы»
-    try:
-        # ссылки на продавца (варианты)
         seller_link = None
         for sel in [
             'a[data-marker="seller-link/link"]',
             'a[href*="/profile/"]',
-            'a[href*="avito.ru/user/"]',
+            'a[href*="/user/"]',
+            'a:has([data-marker="seller-info/name"])',
         ]:
-            loc = page.locator(sel).first
-            if await loc.count():
-                href = await loc.get_attribute("href")
+            cand = page.locator(sel).first
+            if await cand.count():
+                href = await cand.get_attribute("href")
                 if href:
-                    seller_link = normalize_url(href)
-                    break
+                    seller_link = normalize_url(href); break
 
         if seller_link:
-            # открываем профиль
             prof = await page.context.new_page()
             if await smart_goto(prof, seller_link):
                 try:
@@ -577,24 +842,22 @@ async def _open_reviews_ui(page):
                 except Exception:
                     pass
 
-                # ищем вкладку «Отзывы»
-                tab = prof.locator('a,button').filter(has_text=re.compile(r'^ *Отзывы *$', re.I))
+                tab = prof.locator('a,button').filter(has_text=_re.compile(r'Отзывы', _re.I))
                 if await tab.count():
                     try:
-                        await tab.first.click(timeout=4000, force=True)
-                        await prof.wait_for_load_state("domcontentloaded", timeout=7000)
+                        await tab.first.click(timeout=5000, force=True)
+                        await prof.wait_for_load_state("domcontentloaded", timeout=8000)
                     except Exception:
                         pass
                 else:
-                    # иногда отдельная страница отзывов по ссылке /reviews
-                    if not seller_link.rstrip("/").endswith("/reviews"):
-                        reviews_url = seller_link.rstrip("/") + "/reviews"
-                        await smart_goto(prof, reviews_url)
-                        try:
-                            await prof.wait_for_load_state("domcontentloaded", timeout=7000)
-                        except Exception:
-                            pass
-
+                    for u in _guess_reviews_urls(seller_link):
+                        if await smart_goto(prof, u):
+                            try:
+                                await prof.wait_for_load_state("domcontentloaded", timeout=8000)
+                            except Exception:
+                                pass
+                            if await prof.locator(':has-text("Сделка состоялась"), [itemprop="reviewBody"]').count():
+                                return "page", prof
                 return "page", prof
     except Exception:
         pass
@@ -602,31 +865,37 @@ async def _open_reviews_ui(page):
     return "", None
 
 
-async def _collect_reviews(target_page, mode: str, limit: int = 50) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
 
+async def _collect_reviews(target_page, mode: str, limit: int = 50, seller_name: str = "") -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
     try:
         if mode == "dialog":
             await target_page.wait_for_selector('[role="dialog"]', timeout=5000)
         else:
             await target_page.wait_for_selector(
-                '[data-marker^="review("], [data-marker*="feedback"], article, section, li, div',
-                timeout=7000
+                '[itemprop="reviewBody"], [itemprop="review"], [data-marker*="review"], [data-marker*="feedback"], h1:has-text("Отзывы"), h2:has-text("Отзывы")',
+                timeout=8000
             )
     except Exception:
         pass
 
     stagnant = 0
-    for _ in range(16):
+    for _ in range(30):
         if mode == "dialog":
             html = await target_page.evaluate("""
-                () => { const d = document.querySelector('[role="dialog"]');
-                        return d ? d.innerHTML : document.documentElement.innerHTML; }
+                () => {
+                  const d = document.querySelector('[role="dialog"]');
+                  return d ? d.innerHTML : document.documentElement.innerHTML;
+                }
             """)
         else:
             html = await target_page.content()
 
-        batch = _parse_reviews_from_html(html, limit=limit - len(out))
+        if not _looks_like_reviews_context(html, getattr(target_page, "url", "")):
+            batch = []
+        else:
+            batch = _parse_reviews_from_html(html, limit=limit - len(out), seller_name=seller_name)
+
         before = len(out)
         for b in batch:
             if b not in out:
@@ -637,21 +906,52 @@ async def _collect_reviews(target_page, mode: str, limit: int = 50) -> List[Dict
             break
 
         stagnant = stagnant + 1 if len(out) == before else 0
-        if stagnant >= 5:
+        if stagnant >= 8:
             break
 
         try:
-            if mode == "dialog":
-                await target_page.evaluate("""() => {
-                    const d = document.querySelector('[role="dialog"]');
-                    if (d) d.scrollTop = d.scrollHeight;
-                }""")
+            # «Показать ещё»/«Ещё»/«Показать больше»
+            clicked_more = False
+            more_sel = (
+                'button:has-text("Показать ещё"), button:has-text("Показать еще"), '
+                'button:has-text("Ещё"), button:has-text("Еще"), button:has-text("Показать больше")'
+            )
+            btn = target_page.locator(more_sel).first
+            if await btn.count():
+                try:
+                    await btn.click(timeout=3000, force=True)
+                    clicked_more = True
+                except Exception:
+                    pass
+
+            if not clicked_more and mode == "dialog":
+                await target_page.evaluate("""() => { const d = document.querySelector('[role="dialog"]'); if (d) d.scrollTop = d.scrollHeight; }""")
             else:
-                await target_page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                # Прокрутить к последнему видимому отзыву/телу
+                scrolled = False
+                for sel in ['[itemprop="reviewBody"]', '[itemprop="review"]', '[data-marker*="review"]', '[data-marker*="feedback"]', 'main', 'body']:
+                    try:
+                        await target_page.locator(sel).last.scroll_into_view_if_needed(timeout=1200)
+                        scrolled = True
+                        break
+                    except Exception:
+                        continue
+                if not scrolled:
+                    try:
+                        await target_page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                    except Exception:
+                        pass
+                try:
+                    await target_page.mouse.wheel(0, 1800)
+                except Exception:
+                    pass
         except Exception:
             break
+
         await _nap()
+
     return out
+
 
 
 # -------------------- Парсинг карточки --------------------
@@ -739,22 +1039,22 @@ async def parse_item(page_url: str, context) -> Optional[Dict[str, Any]]:
     features_flat = "\n".join([re.sub(r"\s+", " ", t).strip() for t in features_texts if t.strip()])
 
     seller_rate = _extract_seller_rating(soup)
-
+    seller_name = _extract_seller_name(soup)
     # ---- Отзывы ----
-    reviews: List[Dict[str, Any]] = []
+    reviews: List[Dict[str, str]] = []
     ext_page_to_close = None
     try:
         await page.wait_for_timeout(600)
+
         mode, target = await _open_reviews_ui(page)
         if mode == "dialog" and target:
-            reviews = await _collect_reviews(target, mode="dialog", limit=50)
+            reviews = await _collect_reviews(target, mode="dialog", limit=50, seller_name=seller_name)
         elif mode == "page" and target:
-            # если выделили внешний таб — закрыть потом
             if target is not page:
                 ext_page_to_close = target
-            reviews = await _collect_reviews(target, mode="page", limit=50)
+            reviews = await _collect_reviews(target, mode="page", limit=50, seller_name=seller_name)
         else:
-            jlog("INFO", "Отзывы: вход не найден (допустимо для части объявлений)", url=url)
+            jlog("INFO", "Отзывы: вход не найден (это ок для части объявлений)", url=url)
     except Exception as e:
         jlog("WARN", "Отзывы: ошибка сбора", error=str(e), url=url)
     finally:
